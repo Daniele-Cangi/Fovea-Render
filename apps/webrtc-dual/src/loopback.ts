@@ -2,6 +2,7 @@ export type Loopback = {
   pcSend: RTCPeerConnection;
   pcRecv: RTCPeerConnection;
   dcSend: RTCDataChannel;
+  senders: RTCRtpSender[];
 };
 
 export async function createLoopback(opts: {
@@ -16,8 +17,15 @@ export async function createLoopback(opts: {
   pcSend.onicecandidate = (e) => { if (e.candidate) pcRecv.addIceCandidate(e.candidate); };
   pcRecv.onicecandidate = (e) => { if (e.candidate) pcSend.addIceCandidate(e.candidate); };
 
-  // tracks
-  for (const t of opts.tracks) pcSend.addTrack(t);
+  // tracks - capture senders
+  // Using addTrack() - returns RTCRtpSender directly
+  // Order is guaranteed: same as opts.tracks array
+  const senders: RTCRtpSender[] = [];
+  for (const t of opts.tracks) {
+    const sender = pcSend.addTrack(t);
+    senders.push(sender);
+    console.log("Added track via addTrack():", t.id, t.kind);
+  }
 
   // data channel (sender -> receiver)
   const dcSend = pcSend.createDataChannel("meta", { ordered: false, maxRetransmits: 0 });
@@ -41,5 +49,5 @@ export async function createLoopback(opts: {
   await pcRecv.setLocalDescription(answer);
   await pcSend.setRemoteDescription(answer);
 
-  return { pcSend, pcRecv, dcSend };
+  return { pcSend, pcRecv, dcSend, senders };
 }

@@ -1,0 +1,34 @@
+# FoveaRender - Project Dependencies
+# This file documents the main dependencies for reference.
+# The project uses pnpm for package management (see package.json files).
+
+# Core Runtime Dependencies
+three>=0.160.0                    # 3D rendering library
+@mediapipe/face_mesh>=0.4.1633559619  # MediaPipe Face Mesh for eye tracking
+@mediapipe/camera_utils>=0.3.1675466862  # MediaPipe camera utilities
+
+# Development Dependencies
+typescript>=5.9.3                  # TypeScript compiler
+vite>=7.3.0                        # Build tool and dev server
+tsup>=8.5.1                        # TypeScript bundler
+@types/node>=25.0.3               # Node.js type definitions
+
+# Runtime Requirements
+# - Node.js 18+ (for pnpm and build tools)
+# - pnpm 8+ (package manager)
+# - Modern browser with:
+#   - WebGL2 support
+#   - WebRTC support
+#   - MediaDevices API (for webcam access)
+#   - ES2020+ JavaScript support
+
+# Browser Compatibility
+# - Chrome/Edge 90+
+# - Firefox 88+
+# - Safari 14+ (with limitations on WebRTC stats)
+
+# Platform Notes
+# - Windows 10/11
+# - macOS 10.15+
+# - Linux (Ubuntu 20.04+)
+
