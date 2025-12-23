@@ -1,0 +1,19 @@
+{
+  "name": "fovea-render",
+  "private": true,
+  "version": "0.0.1",
+  "scripts": {
+    "dev:demo": "pnpm -C apps/demo-three dev",
+    "dev:webrtc": "pnpm -C apps/webrtc-dual dev",
+    "build": "pnpm -r build"
+  },
+  "dependencies": {
+    "three": "^0.160.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0"
+  }
+}
