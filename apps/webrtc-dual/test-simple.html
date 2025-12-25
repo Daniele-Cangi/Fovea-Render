@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Test Semplice - Tracking</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      color: #fff;
+      font-family: Arial, sans-serif;
+      display: flex;
+      height: 100vh;
+    }
+
+    /* Left panel - Instructions */
+    #instructions {
+      width: 400px;
+      background: #1a1a1a;
+      padding: 30px;
+      overflow-y: auto;
+      border-right: 3px solid #0ff;
+    }
+
+    #instructions h1 {
+      color: #ff0;
+      font-size: 24px;
+      margin-bottom: 20px;
+    }
+
+    .step {
+      background: #2a2a2a;
+      border-left: 4px solid #0ff;
+      padding: 15px;
+      margin: 15px 0;
+      border-radius: 5px;
+    }
+
+    .step-num {
+      display: inline-block;
+      background: #0ff;
+      color: #000;
+      width: 30px;
+      height: 30px;
+      line-height: 30px;
+      text-align: center;
+      border-radius: 50%;
+      font-weight: bold;
+      margin-right: 10px;
+    }
+
+    .step h2 {
+      color: #0ff;
+      font-size: 18px;
+      margin-bottom: 10px;
+    }
+
+    .step p {
+      color: #aaa;
+      line-height: 1.6;
+      margin: 5px 0;
+    }
+
+    .step strong {
+      color: #fff;
+    }
+
+    #status {
+      background: #001a1a;
+      border: 2px solid #0ff;
+      padding: 15px;
+      margin: 20px 0;
+      border-radius: 5px;
+    }
+
+    #status h3 {
+      color: #0ff;
+      margin-bottom: 10px;
+    }
+
+    .status-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 5px 0;
+      border-bottom: 1px solid #333;
+    }
+
+    .status-label {
+      color: #888;
+    }
+
+    .status-value {
+      color: #0f0;
+      font-weight: bold;
+    }
+
+    .error { color: #f00 !important; }
+    .ok { color: #0f0 !important; }
+    .warning { color: #ff0 !important; }
+
+    /* Right panel - Test area */
+    #test-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      background: #0a0a0a;
+    }
+
+    #canvas-container {
+      position: relative;
+      border: 3px solid #0ff;
+    }
+
+    #testCanvas {
+      display: block;
+      background: #1a1a1a;
+      cursor: crosshair;
+    }
+
+    #current-test {
+      position: absolute;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.9);
+      border: 3px solid #ff0;
+      padding: 20px 40px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 24px;
+      font-weight: bold;
+      color: #ff0;
+      z-index: 10;
+    }
+
+    #result-indicator {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.9);
+      border: 3px solid;
+      padding: 15px 30px;
+      border-radius: 10px;
+      font-size: 20px;
+      font-weight: bold;
+      display: none;
+      z-index: 10;
+    }
+
+    #result-indicator.correct {
+      border-color: #0f0;
+      color: #0f0;
+    }
+
+    #result-indicator.wrong {
+      border-color: #f00;
+      color: #f00;
+    }
+
+    .target {
+      position: absolute;
+      width: 80px;
+      height: 80px;
+      border: 4px solid;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 40px;
+      animation: pulse 1.5s infinite;
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+      50% { transform: translate(-50%, -50%) scale(1.1); opacity: 0.8; }
+    }
+
+    .target.active {
+      border-width: 6px;
+      box-shadow: 0 0 20px currentColor;
+    }
+  </style>
+</head>
+<body>
+  <div id="instructions">
+    <h1>🎯 Test Tracking - SEMPLICE</h1>
+
+    <div id="status">
+      <h3>📊 Stato</h3>
+      <div class="status-item">
+        <span class="status-label">Modalità:</span>
+        <span class="status-value" id="mode">MOUSE</span>
+      </div>
+      <div class="status-item">
+        <span class="status-label">Test correnti:</span>
+        <span class="status-value" id="test-counter">0/4</span>
+      </div>
+      <div class="status-item">
+        <span class="status-label">Successi:</span>
+        <span class="status-value ok" id="success-count">0</span>
+      </div>
+      <div class="status-item">
+        <span class="status-label">Errori:</span>
+        <span class="status-value error" id="error-count">0</span>
+      </div>
+    </div>
+
+    <div class="step">
+      <h2><span class="step-num">1</span> COSA VEDERE</h2>
+      <p>A destra vedi un rettangolo con <strong>4 cerchi colorati agli angoli</strong>:</p>
+      <p>🔴 Rosso in alto a sinistra</p>
+      <p>🟢 Verde in alto a destra</p>
+      <p>🔵 Blu in basso a sinistra</p>
+      <p>🟡 Giallo in basso a destra</p>
+    </div>
+
+    <div class="step">
+      <h2><span class="step-num">2</span> COSA FARE</h2>
+      <p><strong>MUOVI IL MOUSE (o guarda)</strong> verso il cerchio che <strong style="color: #ff0;">PULSA</strong> in giallo.</p>
+      <p>Quando arrivi vicino al cerchio, il test registra automaticamente se è <strong>corretto</strong> o <strong>sbagliato</strong>.</p>
+    </div>
+
+    <div class="step">
+      <h2><span class="step-num">3</span> RISULTATO</h2>
+      <p><strong style="color: #0f0;">✓ CORRETTO</strong> = Il tracking funziona bene per questo angolo!</p>
+      <p><strong style="color: #f00;">✗ SBAGLIATO</strong> = C'è ancora un problema nel tracking.</p>
+    </div>
+
+    <div class="step">
+      <h2><span class="step-num">4</span> ALLA FINE</h2>
+      <p>Dopo aver testato tutti e 4 gli angoli, vedrai un <strong>risultato finale</strong>.</p>
+      <p>Se tutti e 4 i test sono ✓ = <strong style="color: #0f0;">TUTTO FUNZIONA!</strong></p>
+      <p>Se anche solo 1 è ✗ = <strong style="color: #f00;">C'è ancora un bug.</strong></p>
+    </div>
+
+    <div style="margin-top: 30px; padding: 15px; background: #2a2a00; border: 2px solid #ff0; border-radius: 5px;">
+      <strong style="color: #ff0;">💡 IMPORTANTE:</strong>
+      <p style="color: #fff; margin-top: 10px;">Il rettangolo BLU TRATTEGGIATO che vedi è il "patch" che dovrebbe catturare la zona dove stai guardando/puntando.</p>
+      <p style="color: #fff; margin-top: 5px;">Il cerchio colorato DEVE essere DENTRO il rettangolo blu quando ci passi sopra!</p>
+    </div>
+  </div>
+
+  <div id="test-area">
+    <div id="current-test"></div>
+    <div id="result-indicator"></div>
+
+    <div id="canvas-container">
+      <canvas id="testCanvas" width="1280" height="720"></canvas>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('testCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const FULL_W = 1280;
+    const FULL_H = 720;
+    const PATCH_W = 640;
+    const PATCH_H = 640;
+
+    // Test sequence
+    const tests = [
+      { name: 'TOP-LEFT', emoji: '🔴', x: 100, y: 100, color: '#f00' },
+      { name: 'TOP-RIGHT', emoji: '🟢', x: FULL_W - 100, y: 100, color: '#0f0' },
+      { name: 'BOTTOM-LEFT', emoji: '🔵', x: 100, y: FULL_H - 100, color: '#00f' },
+      { name: 'BOTTOM-RIGHT', emoji: '🟡', x: FULL_W - 100, y: FULL_H - 100, color: '#ff0' }
+    ];
+
+    let currentTestIndex = 0;
+    let gazeNDC = { x: 0, y: 0 };
+    let patchRect = { x: 0, y: 0 };
+    let results = [];
+    let isWaitingForMovement = false;
+    let testStartTime = Date.now();
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function updatePatchRect() {
+      const cx = (gazeNDC.x * 0.5 + 0.5) * FULL_W;
+      const cy = (-gazeNDC.y * 0.5 + 0.5) * FULL_H;
+
+      const dx = Math.floor(clamp(cx - PATCH_W / 2, 0, FULL_W - PATCH_W));
+      const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
+
+      patchRect.x = dx;
+      patchRect.y = dy;
+    }
+
+    function drawScene() {
+      // Clear
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(0, 0, FULL_W, FULL_H);
+
+      // Draw subtle grid
+      ctx.strokeStyle = '#2a2a2a';
+      ctx.lineWidth = 1;
+      for (let x = 0; x <= FULL_W; x += 128) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, FULL_H);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= FULL_H; y += 128) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(FULL_W, y);
+        ctx.stroke();
+      }
+
+      // Draw patch rectangle
+      ctx.strokeStyle = '#0ff';
+      ctx.lineWidth = 4;
+      ctx.setLineDash([15, 10]);
+      ctx.strokeRect(patchRect.x, patchRect.y, PATCH_W, PATCH_H);
+      ctx.setLineDash([]);
+
+      // Draw patch label
+      ctx.fillStyle = 'rgba(0,255,255,0.3)';
+      ctx.fillRect(patchRect.x, patchRect.y, PATCH_W, PATCH_H);
+      ctx.fillStyle = '#0ff';
+      ctx.font = 'bold 20px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('PATCH AREA', patchRect.x + PATCH_W/2, patchRect.y + PATCH_H/2 - 10);
+      ctx.font = '14px monospace';
+      ctx.fillText(`${patchRect.x}, ${patchRect.y}`, patchRect.x + PATCH_W/2, patchRect.y + PATCH_H/2 + 10);
+
+      // Draw all test targets
+      tests.forEach((test, index) => {
+        const isActive = index === currentTestIndex;
+        const isDone = index < currentTestIndex;
+
+        // Circle
+        ctx.strokeStyle = test.color;
+        ctx.lineWidth = isActive ? 6 : 3;
+        ctx.fillStyle = test.color + (isActive ? '44' : '22');
+
+        const radius = isActive ? 40 : 35;
+
+        ctx.beginPath();
+        ctx.arc(test.x, test.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        // Emoji
+        ctx.font = 'bold 32px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(test.emoji, test.x, test.y);
+
+        // If done, show result
+        if (isDone && results[index]) {
+          const result = results[index];
+          ctx.font = 'bold 24px Arial';
+          ctx.fillStyle = result.correct ? '#0f0' : '#f00';
+          ctx.fillText(result.correct ? '✓' : '✗', test.x, test.y - 60);
+        }
+
+        // If active, draw pulsing border
+        if (isActive && !isWaitingForMovement) {
+          const time = Date.now() - testStartTime;
+          const pulse = Math.sin(time / 200) * 0.5 + 0.5;
+          ctx.strokeStyle = '#ff0';
+          ctx.lineWidth = 8;
+          ctx.globalAlpha = pulse;
+          ctx.beginPath();
+          ctx.arc(test.x, test.y, radius + 10, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+      });
+
+      // Draw gaze crosshair
+      const gazeX = (gazeNDC.x * 0.5 + 0.5) * FULL_W;
+      const gazeY = (-gazeNDC.y * 0.5 + 0.5) * FULL_H;
+
+      ctx.strokeStyle = '#ff0';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(gazeX - 15, gazeY);
+      ctx.lineTo(gazeX + 15, gazeY);
+      ctx.moveTo(gazeX, gazeY - 15);
+      ctx.lineTo(gazeX, gazeY + 15);
+      ctx.stroke();
+    }
+
+    function checkCurrentTest() {
+      if (currentTestIndex >= tests.length) return;
+
+      const test = tests[currentTestIndex];
+      const gazeX = (gazeNDC.x * 0.5 + 0.5) * FULL_W;
+      const gazeY = (-gazeNDC.y * 0.5 + 0.5) * FULL_H;
+
+      // Check if gaze is near target
+      const distX = Math.abs(gazeX - test.x);
+      const distY = Math.abs(gazeY - test.y);
+      const isNear = distX < 100 && distY < 100;
+
+      if (isNear && !isWaitingForMovement) {
+        // Check if target is inside patch
+        const inside = (
+          test.x >= patchRect.x &&
+          test.x <= patchRect.x + PATCH_W &&
+          test.y >= patchRect.y &&
+          test.y <= patchRect.y + PATCH_H
+        );
+
+        // Record result
+        results.push({
+          test: test.name,
+          correct: inside,
+          gazeNDC: { ...gazeNDC },
+          patchRect: { ...patchRect }
+        });
+
+        // Show result indicator
+        const indicator = document.getElementById('result-indicator');
+        indicator.className = inside ? 'correct' : 'wrong';
+        indicator.textContent = inside ? '✓ CORRETTO!' : '✗ SBAGLIATO!';
+        indicator.style.display = 'block';
+
+        // Update counters
+        updateCounters();
+
+        // Wait before next test
+        isWaitingForMovement = true;
+        setTimeout(() => {
+          indicator.style.display = 'none';
+          currentTestIndex++;
+          isWaitingForMovement = false;
+          testStartTime = Date.now();
+
+          if (currentTestIndex >= tests.length) {
+            showFinalResults();
+          } else {
+            updateCurrentTest();
+          }
+        }, 1500);
+      }
+    }
+
+    function updateCurrentTest() {
+      if (currentTestIndex < tests.length) {
+        const test = tests[currentTestIndex];
+        document.getElementById('current-test').textContent = `Muovi verso: ${test.emoji} ${test.name}`;
+        document.getElementById('current-test').style.borderColor = test.color;
+        document.getElementById('current-test').style.color = test.color;
+      }
+    }
+
+    function updateCounters() {
+      document.getElementById('test-counter').textContent = `${currentTestIndex + 1}/4`;
+
+      const successCount = results.filter(r => r.correct).length;
+      const errorCount = results.filter(r => !r.correct).length;
+
+      document.getElementById('success-count').textContent = successCount;
+      document.getElementById('error-count').textContent = errorCount;
+    }
+
+    function showFinalResults() {
+      const allCorrect = results.every(r => r.correct);
+      const successCount = results.filter(r => r.correct).length;
+
+      const currentTest = document.getElementById('current-test');
+      currentTest.style.fontSize = '32px';
+      currentTest.style.padding = '30px 60px';
+
+      if (allCorrect) {
+        currentTest.textContent = '🎉 PERFETTO! Tutto funziona!';
+        currentTest.style.borderColor = '#0f0';
+        currentTest.style.color = '#0f0';
+      } else {
+        currentTest.textContent = `⚠️ ${successCount}/4 corretti - C'è ancora un problema`;
+        currentTest.style.borderColor = '#f00';
+        currentTest.style.color = '#f00';
+      }
+
+      // Log results to console
+      console.log('═══════════════════════════════════');
+      console.log('RISULTATI TEST TRACKING');
+      console.log('═══════════════════════════════════');
+      results.forEach(r => {
+        console.log(`${r.correct ? '✓' : '✗'} ${r.test}`);
+        console.log(`  GazeNDC: (${r.gazeNDC.x.toFixed(2)}, ${r.gazeNDC.y.toFixed(2)})`);
+        console.log(`  Patch: (${r.patchRect.x}, ${r.patchRect.y})`);
+      });
+      console.log('═══════════════════════════════════');
+    }
+
+    // Mouse tracking
+    canvas.addEventListener('mousemove', (e) => {
+      const x = e.offsetX / canvas.width;
+      const y = e.offsetY / canvas.height;
+
+      gazeNDC.x = x * 2 - 1;
+      gazeNDC.y = -(y * 2 - 1);
+
+      updatePatchRect();
+      checkCurrentTest();
+      drawScene();
+    });
+
+    // Animation loop
+    function animate() {
+      drawScene();
+      requestAnimationFrame(animate);
+    }
+
+    // Initialize
+    updateCurrentTest();
+    animate();
+
+    // Try to read from demo
+    setInterval(() => {
+      try {
+        const stats = document.getElementById('senderStats') ||
+                     window.opener?.document?.getElementById('senderStats');
+
+        if (stats) {
+          const text = stats.textContent;
+          const matchGaze = text.match(/gazeNDC:\s+([\-\d.]+),\s+([\-\d.]+)/);
+          const matchUseEye = text.match(/use_eye:\s+(true|false)/);
+
+          if (matchGaze) {
+            gazeNDC.x = parseFloat(matchGaze[1]);
+            gazeNDC.y = parseFloat(matchGaze[2]);
+            const useEye = matchUseEye ? matchUseEye[1] === 'true' : false;
+
+            document.getElementById('mode').textContent = useEye ? '👁️ EYE TRACKING' : '🖱️ MOUSE';
+            document.getElementById('mode').className = useEye ? 'status-value ok' : 'status-value warning';
+
+            updatePatchRect();
+            checkCurrentTest();
+          }
+        }
+      } catch (e) {
+        // Continue with mouse mode
+      }
+    }, 100);
+  </script>
+</body>
+</html>

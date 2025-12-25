@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Patch Position Test</title>
+  <style>
+    body {
+      margin: 0;
+      background: #0a0a0a;
+      color: #0ff;
+      font-family: 'Courier New', monospace;
+      padding: 20px;
+    }
+    .container {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+    }
+    .scene-container {
+      position: relative;
+      border: 2px solid #0ff;
+    }
+    #scene {
+      display: block;
+      background: #000;
+    }
+    .overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      pointer-events: none;
+    }
+    .patch-rect {
+      position: absolute;
+      border: 3px solid #f0f;
+      box-shadow: 0 0 10px #f0f;
+      box-sizing: border-box;
+    }
+    .cursor {
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #0ff;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 10px #0ff;
+    }
+    .cursor::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 40px;
+      height: 40px;
+      border: 2px solid #0ff;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+    }
+    .info {
+      background: #1a1a1a;
+      padding: 20px;
+      border: 1px solid #0ff;
+      max-width: 400px;
+    }
+    .label {
+      position: absolute;
+      background: rgba(0,0,0,0.8);
+      padding: 5px 10px;
+      border: 1px solid #0ff;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .label.top-left { top: 10px; left: 10px; }
+    .label.top-right { top: 10px; right: 10px; }
+    .label.bottom-left { bottom: 10px; left: 10px; }
+    .label.bottom-right { bottom: 10px; right: 10px; }
+    .label.center { top: 50%; left: 50%; transform: translate(-50%, -50%); border-color: #ff0; color: #ff0; }
+
+    table { width: 100%; margin-top: 10px; border-collapse: collapse; }
+    td { padding: 5px; border: 1px solid #333; }
+    .val { color: #0f0; font-weight: bold; }
+    .check { color: #ff0; }
+    h3 { margin-top: 15px; border-bottom: 1px solid #0ff; padding-bottom: 5px; }
+  </style>
+</head>
+<body>
+  <h1>🎯 Patch Position Diagnostic</h1>
+  <p style="color: #ff0;">Muovi il mouse sulla scena e osserva dove va il rettangolo MAGENTA (patch area)</p>
+
+  <div class="container">
+    <div class="scene-container">
+      <canvas id="scene" width="800" height="600"></canvas>
+      <div class="overlay" id="overlay" style="width: 800px; height: 600px;">
+        <div class="patch-rect" id="patchRect"></div>
+        <div class="cursor" id="cursor"></div>
+
+        <!-- Labels -->
+        <div class="label top-left">TOP-LEFT<br>(X-, Y+)</div>
+        <div class="label top-right">TOP-RIGHT<br>(X+, Y+)</div>
+        <div class="label bottom-left">BOTTOM-LEFT<br>(X-, Y-)</div>
+        <div class="label bottom-right">BOTTOM-RIGHT<br>(X+, Y-)</div>
+        <div class="label center">CENTER<br>(0, 0)</div>
+      </div>
+    </div>
+
+    <div class="info">
+      <h3>Mouse/Gaze Position</h3>
+      <table>
+        <tr><td>Screen X:</td><td class="val" id="screenX">0</td></tr>
+        <tr><td>Screen Y:</td><td class="val" id="screenY">0</td></tr>
+        <tr><td>NDC X:</td><td class="val" id="ndcX">0.00</td></tr>
+        <tr><td>NDC Y:</td><td class="val" id="ndcY">0.00</td></tr>
+      </table>
+
+      <h3>Patch Rectangle</h3>
+      <table>
+        <tr><td>Left:</td><td class="val" id="patchLeft">0</td></tr>
+        <tr><td>Top:</td><td class="val" id="patchTop">0</td></tr>
+        <tr><td>Width:</td><td class="val" id="patchWidth">640</td></tr>
+        <tr><td>Height:</td><td class="val" id="patchHeight">640</td></tr>
+      </table>
+
+      <h3>🧪 Verifica Comportamento</h3>
+      <div style="margin-top: 10px; font-size: 14px; line-height: 1.8;">
+        <strong>ATTESO:</strong><br>
+        • Mouse su TOP-RIGHT → Patch su TOP-RIGHT ✓<br>
+        • Mouse su TOP-LEFT → Patch su TOP-LEFT ✓<br>
+        • Mouse su BOTTOM-RIGHT → Patch su BOTTOM-RIGHT ✓<br>
+        • Mouse su BOTTOM-LEFT → Patch su BOTTOM-LEFT ✓<br>
+        <br>
+        <strong class="check" id="behavior">Muovi mouse per testare...</strong>
+      </div>
+
+      <h3>Debug Info</h3>
+      <div style="font-size: 12px; color: #888; margin-top: 10px;">
+        Il rettangolo MAGENTA rappresenta la zona che verrà renderizzata nel PATCH canvas.<br><br>
+        Se la patch va nella direzione OPPOSTA rispetto al mouse, c'è un problema con le coordinate.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('scene');
+    const ctx = canvas.getContext('2d');
+    const overlay = document.getElementById('overlay');
+    const patchRect = document.getElementById('patchRect');
+    const cursor = document.getElementById('cursor');
+
+    const FULL_W = 800;
+    const FULL_H = 600;
+    const PATCH_SIZE = 640;
+
+    let mouseNDC = { x: 0, y: 0 };
+    let screenPos = { x: 0, y: 0 };
+
+    // Draw scene with labels
+    function drawScene() {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, FULL_W, FULL_H);
+
+      // Draw colored quadrants
+      ctx.fillStyle = 'rgba(255,0,0,0.2)'; // Red - top left
+      ctx.fillRect(0, 0, FULL_W/2, FULL_H/2);
+
+      ctx.fillStyle = 'rgba(0,255,0,0.2)'; // Green - top right
+      ctx.fillRect(FULL_W/2, 0, FULL_W/2, FULL_H/2);
+
+      ctx.fillStyle = 'rgba(0,0,255,0.2)'; // Blue - bottom left
+      ctx.fillRect(0, FULL_H/2, FULL_W/2, FULL_H/2);
+
+      ctx.fillStyle = 'rgba(255,255,0,0.2)'; // Yellow - bottom right
+      ctx.fillRect(FULL_W/2, FULL_H/2, FULL_W/2, FULL_H/2);
+
+      // Draw grid
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 1;
+      for (let x = 0; x <= FULL_W; x += 100) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, FULL_H);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= FULL_H; y += 100) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(FULL_W, y);
+        ctx.stroke();
+      }
+
+      // Draw axes
+      ctx.strokeStyle = '#666';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(FULL_W/2, 0);
+      ctx.lineTo(FULL_W/2, FULL_H);
+      ctx.moveTo(0, FULL_H/2);
+      ctx.lineTo(FULL_W, FULL_H/2);
+      ctx.stroke();
+
+      // Labels on canvas
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 20px monospace';
+      ctx.fillText('RED', 20, 30);
+      ctx.fillText('TOP-LEFT', 20, 55);
+
+      ctx.fillText('GREEN', FULL_W - 120, 30);
+      ctx.fillText('TOP-RIGHT', FULL_W - 140, 55);
+
+      ctx.fillText('BLUE', 20, FULL_H - 40);
+      ctx.fillText('BOTTOM-LEFT', 20, FULL_H - 15);
+
+      ctx.fillText('YELLOW', FULL_W - 120, FULL_H - 40);
+      ctx.fillText('BOTTOM-RIGHT', FULL_W - 180, FULL_H - 15);
+    }
+
+    drawScene();
+
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      screenPos.x = e.clientX - rect.left;
+      screenPos.y = e.clientY - rect.top;
+
+      // Convert to NDC
+      mouseNDC.x = (screenPos.x / FULL_W) * 2 - 1;
+      mouseNDC.y = -((screenPos.y / FULL_H) * 2 - 1); // Flip Y for NDC
+
+      updateDisplay();
+    });
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function updateDisplay() {
+      // Update cursor position
+      cursor.style.left = screenPos.x + 'px';
+      cursor.style.top = screenPos.y + 'px';
+
+      // Calculate patch rect (same logic as main.ts computePatchRectTopLeft)
+      const cx = (mouseNDC.x * 0.5 + 0.5) * FULL_W;
+      const cy = (-mouseNDC.y * 0.5 + 0.5) * FULL_H; // top-left origin
+
+      const dx = Math.floor(clamp(cx - PATCH_SIZE / 2, 0, FULL_W - PATCH_SIZE));
+      const dy = Math.floor(clamp(cy - PATCH_SIZE / 2, 0, FULL_H - PATCH_SIZE));
+
+      // Update patch rect
+      patchRect.style.left = dx + 'px';
+      patchRect.style.top = dy + 'px';
+      patchRect.style.width = PATCH_SIZE + 'px';
+      patchRect.style.height = PATCH_SIZE + 'px';
+
+      // Update info
+      document.getElementById('screenX').textContent = Math.round(screenPos.x);
+      document.getElementById('screenY').textContent = Math.round(screenPos.y);
+      document.getElementById('ndcX').textContent = mouseNDC.x.toFixed(2);
+      document.getElementById('ndcY').textContent = mouseNDC.y.toFixed(2);
+      document.getElementById('patchLeft').textContent = dx;
+      document.getElementById('patchTop').textContent = dy;
+      document.getElementById('patchWidth').textContent = PATCH_SIZE;
+      document.getElementById('patchHeight').textContent = PATCH_SIZE;
+
+      // Behavioral check
+      let behavior = '';
+      const patchCenterX = dx + PATCH_SIZE / 2;
+      const patchCenterY = dy + PATCH_SIZE / 2;
+
+      // Check quadrant alignment
+      let expectedQuadrant = '';
+      let actualQuadrant = '';
+
+      // Expected based on mouse position
+      if (screenPos.x < FULL_W/2 && screenPos.y < FULL_H/2) expectedQuadrant = 'TOP-LEFT (RED)';
+      else if (screenPos.x >= FULL_W/2 && screenPos.y < FULL_H/2) expectedQuadrant = 'TOP-RIGHT (GREEN)';
+      else if (screenPos.x < FULL_W/2 && screenPos.y >= FULL_H/2) expectedQuadrant = 'BOTTOM-LEFT (BLUE)';
+      else expectedQuadrant = 'BOTTOM-RIGHT (YELLOW)';
+
+      // Actual based on patch center
+      if (patchCenterX < FULL_W/2 && patchCenterY < FULL_H/2) actualQuadrant = 'TOP-LEFT (RED)';
+      else if (patchCenterX >= FULL_W/2 && patchCenterY < FULL_H/2) actualQuadrant = 'TOP-RIGHT (GREEN)';
+      else if (patchCenterX < FULL_W/2 && patchCenterY >= FULL_H/2) actualQuadrant = 'BOTTOM-LEFT (BLUE)';
+      else actualQuadrant = 'BOTTOM-RIGHT (YELLOW)';
+
+      const behaviorElem = document.getElementById('behavior');
+      if (expectedQuadrant === actualQuadrant) {
+        behaviorElem.innerHTML = `✓ CORRETTO<br>Mouse: ${expectedQuadrant}<br>Patch: ${actualQuadrant}`;
+        behaviorElem.style.color = '#0f0';
+      } else {
+        behaviorElem.innerHTML = `✗ ERRORE<br>Mouse: ${expectedQuadrant}<br>Patch: ${actualQuadrant}<br><br>La patch è nel quadrante SBAGLIATO!`;
+        behaviorElem.style.color = '#f00';
+      }
+    }
+
+    // Initial update
+    updateDisplay();
+  </script>
+</body>
+</html>

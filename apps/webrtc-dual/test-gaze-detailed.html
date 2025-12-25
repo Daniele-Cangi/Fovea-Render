@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Detailed Gaze Test</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: #0ff;
+      font-family: 'Courier New', monospace;
+      overflow: hidden;
+    }
+    #canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+    #info {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: rgba(0,0,0,0.9);
+      padding: 20px;
+      border: 2px solid #0ff;
+      font-size: 16px;
+      line-height: 1.8;
+    }
+    .target {
+      position: absolute;
+      width: 80px;
+      height: 80px;
+      border: 3px solid #f0f;
+      background: rgba(255,0,255,0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: bold;
+      color: #f0f;
+      cursor: pointer;
+    }
+    .target:hover {
+      background: rgba(255,0,255,0.4);
+      border-color: #ff0;
+      color: #ff0;
+    }
+    .current {
+      background: rgba(0,255,0,0.3) !important;
+      border-color: #0f0 !important;
+      color: #0f0 !important;
+    }
+    .val { color: #0f0; font-weight: bold; }
+    .warn { color: #ff0; }
+    .err { color: #f00; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <div id="info">
+    <div style="font-size: 20px; margin-bottom: 10px; color: #ff0;">🎯 Gaze Direction Test</div>
+    <div style="margin-bottom: 15px;">
+      <strong>Istruzioni:</strong><br>
+      1. Guarda/muovi mouse sui quadrati MAGENTA<br>
+      2. Verifica che il cursore CYAN segua correttamente<br>
+      3. Controlla i valori qui sotto
+    </div>
+    <div style="border-top: 1px solid #0ff; padding-top: 10px;">
+      Mouse/Gaze X: <span class="val" id="mx">0.00</span> <span id="xdir"></span><br>
+      Mouse/Gaze Y: <span class="val" id="my">0.00</span> <span id="ydir"></span><br>
+    </div>
+    <div style="border-top: 1px solid #0ff; margin-top: 10px; padding-top: 10px;">
+      <strong>Target corrente:</strong> <span class="val" id="current">CENTER</span><br>
+      <strong>Distanza:</strong> <span class="val" id="dist">0.00</span>
+    </div>
+    <div style="margin-top: 15px; font-size: 12px; color: #888;">
+      Premi i quadrati per vedere le coordinate attese
+    </div>
+  </div>
+
+  <!-- Target boxes in 9 positions -->
+  <div class="target" id="t-topleft" style="top: 10px; left: 10px;">TOP-LEFT<br>(-1, +1)</div>
+  <div class="target" id="t-top" style="top: 10px; left: 50%; transform: translateX(-50%);">TOP<br>(0, +1)</div>
+  <div class="target" id="t-topright" style="top: 10px; right: 10px;">TOP-RIGHT<br>(+1, +1)</div>
+
+  <div class="target" id="t-left" style="top: 50%; left: 10px; transform: translateY(-50%);">LEFT<br>(-1, 0)</div>
+  <div class="target" id="t-center" style="top: 50%; left: 50%; transform: translate(-50%, -50%);">CENTER<br>(0, 0)</div>
+  <div class="target" id="t-right" style="top: 50%; right: 10px; transform: translateY(-50%);">RIGHT<br>(+1, 0)</div>
+
+  <div class="target" id="t-bottomleft" style="bottom: 10px; left: 10px;">BOTTOM-LEFT<br>(-1, -1)</div>
+  <div class="target" id="t-bottom" style="bottom: 10px; left: 50%; transform: translateX(-50%);">BOTTOM<br>(0, -1)</div>
+  <div class="target" id="t-bottomright" style="bottom: 10px; right: 10px;">BOTTOM-RIGHT<br>(+1, -1)</div>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let mouseX = 0, mouseY = 0;
+    let targetX = 0, targetY = 0;
+    let currentTarget = 'center';
+
+    const targets = {
+      'topleft': { x: -0.9, y: 0.9, label: 'TOP-LEFT' },
+      'top': { x: 0, y: 0.9, label: 'TOP' },
+      'topright': { x: 0.9, y: 0.9, label: 'TOP-RIGHT' },
+      'left': { x: -0.9, y: 0, label: 'LEFT' },
+      'center': { x: 0, y: 0, label: 'CENTER' },
+      'right': { x: 0.9, y: 0, label: 'RIGHT' },
+      'bottomleft': { x: -0.9, y: -0.9, label: 'BOTTOM-LEFT' },
+      'bottom': { x: 0, y: -0.9, label: 'BOTTOM' },
+      'bottomright': { x: 0.9, y: -0.9, label: 'BOTTOM-RIGHT' }
+    };
+
+    // Setup target clicks
+    Object.keys(targets).forEach(key => {
+      const elem = document.getElementById('t-' + key);
+      elem.addEventListener('click', () => {
+        // Remove current class from all
+        document.querySelectorAll('.target').forEach(t => t.classList.remove('current'));
+        // Add to clicked
+        elem.classList.add('current');
+        currentTarget = key;
+        targetX = targets[key].x;
+        targetY = targets[key].y;
+      });
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX / rect.width;
+      const y = e.clientY / rect.height;
+
+      // Convert to NDC (-1..1)
+      mouseX = x * 2 - 1;
+      mouseY = -(y * 2 - 1); // Flip Y for NDC (Y+ is up)
+    });
+
+    function draw() {
+      const w = canvas.width;
+      const h = canvas.height;
+
+      // Clear
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, w, h);
+
+      // Draw grid
+      ctx.strokeStyle = '#222';
+      ctx.lineWidth = 1;
+
+      // Vertical lines
+      for (let i = 0; i <= 10; i++) {
+        const x = (i / 10) * w;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+      }
+
+      // Horizontal lines
+      for (let i = 0; i <= 10; i++) {
+        const y = (i / 10) * h;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
+
+      // Draw axes
+      ctx.strokeStyle = '#444';
+      ctx.lineWidth = 3;
+
+      // X axis (horizontal center)
+      ctx.beginPath();
+      ctx.moveTo(0, h/2);
+      ctx.lineTo(w, h/2);
+      ctx.stroke();
+
+      // Y axis (vertical center)
+      ctx.beginPath();
+      ctx.moveTo(w/2, 0);
+      ctx.lineTo(w/2, h);
+      ctx.stroke();
+
+      // Draw target position (if not center)
+      if (currentTarget !== 'center') {
+        const tx = (targetX * 0.5 + 0.5) * w;
+        const ty = (-targetY * 0.5 + 0.5) * h; // Flip for screen coords
+
+        // Target circle
+        ctx.strokeStyle = '#f0f';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([10, 5]);
+        ctx.beginPath();
+        ctx.arc(tx, ty, 50, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Target center
+        ctx.fillStyle = '#f0f';
+        ctx.beginPath();
+        ctx.arc(tx, ty, 8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Draw mouse cursor
+      const cx = (mouseX * 0.5 + 0.5) * w;
+      const cy = (-mouseY * 0.5 + 0.5) * h; // Flip for screen coords
+
+      // Cursor circle (large)
+      ctx.fillStyle = 'rgba(0,255,255,0.3)';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 25, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Cursor center
+      ctx.fillStyle = '#0ff';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Crosshair
+      ctx.strokeStyle = '#0ff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - 35, cy);
+      ctx.lineTo(cx + 35, cy);
+      ctx.moveTo(cx, cy - 35);
+      ctx.lineTo(cx, cy + 35);
+      ctx.stroke();
+
+      // Draw line from cursor to target
+      if (currentTarget !== 'center') {
+        const tx = (targetX * 0.5 + 0.5) * w;
+        const ty = (-targetY * 0.5 + 0.5) * h;
+
+        ctx.strokeStyle = 'rgba(255,255,0,0.5)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(tx, ty);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Update info
+      document.getElementById('mx').textContent = mouseX.toFixed(2);
+      document.getElementById('my').textContent = mouseY.toFixed(2);
+
+      // Direction indicators
+      let xdir = '';
+      if (mouseX > 0.1) xdir = '→ RIGHT';
+      else if (mouseX < -0.1) xdir = '← LEFT';
+      else xdir = '• CENTER';
+
+      let ydir = '';
+      if (mouseY > 0.1) ydir = '↑ UP';
+      else if (mouseY < -0.1) ydir = '↓ DOWN';
+      else ydir = '• CENTER';
+
+      document.getElementById('xdir').textContent = xdir;
+      document.getElementById('ydir').textContent = ydir;
+
+      document.getElementById('current').textContent = targets[currentTarget].label;
+
+      // Calculate distance to target
+      const dx = mouseX - targetX;
+      const dy = mouseY - targetY;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      document.getElementById('dist').textContent = dist.toFixed(2);
+
+      requestAnimationFrame(draw);
+    }
+
+    draw();
+
+    // Instructions
+    setTimeout(() => {
+      alert('🎯 ISTRUZIONI DETTAGLIATE:\n\n' +
+            '1. Clicca su uno dei quadrati MAGENTA (es. TOP-RIGHT)\n' +
+            '2. Guarda/muovi mouse verso quel quadrato\n' +
+            '3. Il cursore CYAN dovrebbe seguire il mouse\n' +
+            '4. Controlla che:\n' +
+            '   • X value cambia correttamente (LEFT = negativo, RIGHT = positivo)\n' +
+            '   • Y value cambia correttamente (DOWN = negativo, UP = positivo)\n\n' +
+            'Se Y è invertito:\n' +
+            '   Guardi SU → Y value diventa NEGATIVO ❌\n' +
+            '   Dovrebbe essere: Guardi SU → Y value diventa POSITIVO ✓\n\n' +
+            'Testa tutti i 9 quadrati e nota quale si comporta male!');
+    }, 500);
+  </script>
+</body>
+</html>

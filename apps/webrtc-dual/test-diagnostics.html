@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>FoveaRender - Diagnostics</title>
+  <style>
+    body {
+      font-family: 'Courier New', monospace;
+      background: #0a0a0a;
+      color: #0f0;
+      padding: 20px;
+    }
+    .test {
+      margin: 10px 0;
+      padding: 10px;
+      border-left: 3px solid #0f0;
+      background: #1a1a1a;
+    }
+    .pass { border-left-color: #0f0; }
+    .fail { border-left-color: #f00; color: #f00; }
+    .warn { border-left-color: #ff0; color: #ff0; }
+    .info { border-left-color: #0ff; color: #0ff; }
+    h1 { color: #0ff; }
+    button {
+      background: #0f0;
+      color: #000;
+      border: none;
+      padding: 10px 20px;
+      cursor: pointer;
+      font-weight: bold;
+      margin: 5px;
+    }
+    button:hover { background: #0ff; }
+    #results { margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <h1>🔍 FoveaRender System Diagnostics</h1>
+
+  <button onclick="runTests()">▶ Run All Tests</button>
+  <button onclick="location.href='/'">← Back to Demo</button>
+
+  <div id="results"></div>
+
+  <script>
+    const results = document.getElementById('results');
+
+    function log(msg, type = 'info') {
+      const div = document.createElement('div');
+      div.className = `test ${type}`;
+      div.innerHTML = msg;
+      results.appendChild(div);
+    }
+
+    async function runTests() {
+      results.innerHTML = '<div class="test info">🔄 Running diagnostics...</div>';
+
+      // Test 1: WebGL2 Support
+      const canvas = document.createElement('canvas');
+      const gl = canvas.getContext('webgl2');
+      if (gl) {
+        log('✅ WebGL2 Support: ENABLED', 'pass');
+
+        // Check GPU timer extension
+        const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+        if (ext) {
+          log('✅ GPU Timer Extension: AVAILABLE', 'pass');
+        } else {
+          log('⚠️ GPU Timer Extension: NOT AVAILABLE (timing will use CPU fallback)', 'warn');
+        }
+      } else {
+        log('❌ WebGL2 Support: MISSING - Application will not work!', 'fail');
+      }
+
+      // Test 2: WebRTC Support
+      if (window.RTCPeerConnection) {
+        log('✅ WebRTC Support: ENABLED', 'pass');
+      } else {
+        log('❌ WebRTC Support: MISSING - Streaming will not work!', 'fail');
+      }
+
+      // Test 3: MediaDevices API
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        log('✅ MediaDevices API: ENABLED', 'pass');
+
+        // Try to enumerate devices
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const cameras = devices.filter(d => d.kind === 'videoinput');
+          if (cameras.length > 0) {
+            log(`✅ Webcam Detected: ${cameras.length} camera(s) found`, 'pass');
+          } else {
+            log('⚠️ Webcam: No cameras detected (eye tracking will fallback to mouse)', 'warn');
+          }
+        } catch (e) {
+          log('⚠️ Camera Enumeration: Permission needed', 'warn');
+        }
+      } else {
+        log('❌ MediaDevices API: MISSING - Eye tracking will not work!', 'fail');
+      }
+
+      // Test 4: LocalStorage
+      try {
+        localStorage.setItem('test', 'ok');
+        localStorage.removeItem('test');
+        log('✅ LocalStorage: ENABLED (calibration can be saved)', 'pass');
+      } catch (e) {
+        log('⚠️ LocalStorage: DISABLED (calibration will not persist)', 'warn');
+      }
+
+      // Test 5: ES2020+ Features
+      try {
+        eval('const x = { a: 1, ...{ b: 2 } }; const y = x?.a ?? 0;');
+        log('✅ ES2020+ Features: SUPPORTED', 'pass');
+      } catch (e) {
+        log('❌ ES2020+ Features: NOT SUPPORTED - Use modern browser!', 'fail');
+      }
+
+      // Test 6: Check MediaPipe CDN
+      log('🔄 Checking MediaPipe CDN...', 'info');
+      try {
+        const response = await fetch('https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js', { method: 'HEAD' });
+        if (response.ok) {
+          log('✅ MediaPipe CDN: REACHABLE', 'pass');
+        } else {
+          log('❌ MediaPipe CDN: UNREACHABLE - Eye tracking will fail!', 'fail');
+        }
+      } catch (e) {
+        log('❌ MediaPipe CDN: NETWORK ERROR - Check internet connection!', 'fail');
+      }
+
+      // Test 7: Performance API
+      if (window.performance && performance.now) {
+        log('✅ Performance API: ENABLED', 'pass');
+      } else {
+        log('❌ Performance API: MISSING - Timing will be inaccurate!', 'fail');
+      }
+
+      // Test 8: DataChannel support
+      try {
+        const pc = new RTCPeerConnection();
+        const dc = pc.createDataChannel('test');
+        dc.close();
+        pc.close();
+        log('✅ RTCDataChannel: SUPPORTED', 'pass');
+      } catch (e) {
+        log('❌ RTCDataChannel: FAILED - Metadata sync will not work!', 'fail');
+      }
+
+      // Summary
+      const passes = results.querySelectorAll('.pass').length;
+      const fails = results.querySelectorAll('.fail').length;
+      const warns = results.querySelectorAll('.warn').length;
+
+      log(`<br><strong>📊 Summary: ${passes} passed, ${warns} warnings, ${fails} failed</strong>`,
+          fails > 0 ? 'fail' : warns > 0 ? 'warn' : 'pass');
+
+      if (fails === 0 && warns === 0) {
+        log('🎉 System is ready for testing! All checks passed.', 'pass');
+      } else if (fails === 0) {
+        log('⚠️ System is functional but has warnings. Demo should work with minor limitations.', 'warn');
+      } else {
+        log('❌ Critical issues detected. Please fix errors before testing.', 'fail');
+      }
+    }
+
+    // Auto-run on load
+    window.addEventListener('load', () => {
+      setTimeout(runTests, 500);
+    });
+  </script>
+</body>
+</html>

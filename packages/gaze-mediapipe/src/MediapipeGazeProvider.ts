@@ -283,6 +283,10 @@ export class MediapipeGazeProvider {
     // mirror feel (like webcam preview) - apply AFTER calibration
     if (this.opts.mirrorX) gx = -gx;
 
+    // NOTE: Y axis NOT inverted here - conversion to screen coords happens later in main.ts
+    // MediaPipe Y: 0 (top) to 1 (bottom) → normalized to -1.1 (top) to +1.1 (bottom)
+    // This matches the conversion logic in computePatchRectTopLeft() which does: cy = (-gaze.y * 0.5 + 0.5) * FULL_H
+
     // clamp to NDC-ish
     gx = clamp(gx, -1, 1);
     gy = clamp(gy, -1, 1);

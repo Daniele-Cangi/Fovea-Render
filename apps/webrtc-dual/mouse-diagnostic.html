@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Mouse Diagnostic - Live Values</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: #0f0;
+      font-family: 'Courier New', monospace;
+      padding: 20px;
+      font-size: 14px;
+    }
+    h1 { color: #ff0; }
+    .container {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 20px;
+      margin: 20px 0;
+    }
+    .panel {
+      background: #1a1a1a;
+      border: 2px solid #0ff;
+      padding: 15px;
+      border-radius: 10px;
+    }
+    .panel h2 {
+      color: #0ff;
+      margin-top: 0;
+      font-size: 18px;
+    }
+    .value-row {
+      display: grid;
+      grid-template-columns: 200px 150px 300px;
+      gap: 10px;
+      padding: 5px 0;
+      border-bottom: 1px solid #333;
+    }
+    .label { color: #0ff; font-weight: bold; }
+    .value { color: #0f0; font-family: 'Courier New'; }
+    .expected { color: #888; font-size: 12px; }
+    .error { color: #f00; }
+    .ok { color: #0f0; }
+    .warning { color: #ff0; }
+    #live-log {
+      background: #000;
+      border: 1px solid #333;
+      padding: 10px;
+      height: 300px;
+      overflow-y: auto;
+      font-size: 12px;
+      margin-top: 20px;
+    }
+    .log-entry {
+      padding: 3px 0;
+      border-bottom: 1px solid #111;
+    }
+  </style>
+</head>
+<body>
+  <h1>🖱️ Mouse Diagnostic - Live Capture</h1>
+  <p style="color: #ff0;">This page reads LIVE values from the demo when you move the mouse</p>
+  <p style="color: #0ff;">Open demo at <a href="http://localhost:5175" target="_blank" style="color: #0ff;">http://localhost:5175</a> in THIS SAME WINDOW (navigate away)</p>
+
+  <div class="container">
+    <div class="panel">
+      <h2>📊 Current Values (from stats panel)</h2>
+      <div class="value-row">
+        <div class="label">gazeNDC.x</div>
+        <div class="value" id="gaze_x">-</div>
+        <div class="expected">-1 (LEFT) to +1 (RIGHT)</div>
+      </div>
+      <div class="value-row">
+        <div class="label">gazeNDC.y</div>
+        <div class="value" id="gaze_y">-</div>
+        <div class="expected">-1 (BOTTOM) to +1 (TOP)</div>
+      </div>
+      <div class="value-row">
+        <div class="label">use_eye</div>
+        <div class="value" id="use_eye">-</div>
+        <div class="expected">Should be FALSE (mouse mode)</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>🎯 Computed Patch Position</h2>
+      <div class="value-row">
+        <div class="label">cx (center X)</div>
+        <div class="value" id="cx">-</div>
+        <div class="expected">(gx * 0.5 + 0.5) * 1280</div>
+      </div>
+      <div class="value-row">
+        <div class="label">cy (center Y)</div>
+        <div class="value" id="cy">-</div>
+        <div class="expected">(-gy * 0.5 + 0.5) * 720</div>
+      </div>
+      <div class="value-row">
+        <div class="label">dx (patch left)</div>
+        <div class="value" id="dx">-</div>
+        <div class="expected">clamp(cx - 320, 0, 640)</div>
+      </div>
+      <div class="value-row">
+        <div class="label">dy (patch top)</div>
+        <div class="value" id="dy">-</div>
+        <div class="expected">clamp(cy - 320, 0, 80)</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>✅ Corner Tests (move mouse to corners)</h2>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+      <div id="test_tl" class="value">TOP-LEFT: -</div>
+      <div id="test_tr" class="value">TOP-RIGHT: -</div>
+      <div id="test_bl" class="value">BOTTOM-LEFT: -</div>
+      <div id="test_br" class="value">BOTTOM-RIGHT: -</div>
+    </div>
+  </div>
+
+  <div id="live-log">
+    <strong style="color: #0ff;">📝 Live Log (updates when mouse moves)</strong>
+  </div>
+
+  <script>
+    const FULL_W = 1280;
+    const FULL_H = 720;
+    const PATCH_W = 640;
+    const PATCH_H = 640;
+
+    let lastGX = null;
+    let lastGY = null;
+    let logCount = 0;
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function addLog(msg, color = '#0f0') {
+      const log = document.getElementById('live-log');
+      const timestamp = new Date().toLocaleTimeString() + '.' + new Date().getMilliseconds().toString().padStart(3, '0');
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      entry.style.color = color;
+      entry.innerHTML = `[${timestamp}] ${msg}`;
+      log.insertBefore(entry, log.children[1]); // Insert after header
+
+      // Keep only last 50 entries
+      logCount++;
+      if (logCount > 50) {
+        log.removeChild(log.lastChild);
+      }
+    }
+
+    function updateValues() {
+      try {
+        const stats = document.getElementById('senderStats');
+        if (!stats) {
+          document.getElementById('gaze_x').textContent = 'Stats panel not found';
+          document.getElementById('gaze_x').className = 'value error';
+          return;
+        }
+
+        const text = stats.textContent;
+
+        // Parse values
+        const matchGaze = text.match(/gazeNDC:\s+([\-\d.]+),\s+([\-\d.]+)/);
+        const matchUseEye = text.match(/use_eye:\s+(true|false)/);
+
+        if (!matchGaze) {
+          document.getElementById('gaze_x').textContent = 'Cannot parse gazeNDC';
+          return;
+        }
+
+        const gx = parseFloat(matchGaze[1]);
+        const gy = parseFloat(matchGaze[2]);
+        const useEye = matchUseEye ? matchUseEye[1] === 'true' : false;
+
+        // Only log if values changed significantly
+        if (lastGX === null || Math.abs(gx - lastGX) > 0.05 || Math.abs(gy - lastGY) > 0.05) {
+          lastGX = gx;
+          lastGY = gy;
+
+          const quadrant = `${gx < -0.3 ? 'LEFT' : gx > 0.3 ? 'RIGHT' : 'CENTER'} / ${gy < -0.3 ? 'BOTTOM' : gy > 0.3 ? 'TOP' : 'CENTER'}`;
+          addLog(`🖱️ Mouse at ${quadrant}: gaze=(${gx.toFixed(2)}, ${gy.toFixed(2)})`, '#0ff');
+        }
+
+        // Update display
+        document.getElementById('gaze_x').textContent = gx.toFixed(3);
+        document.getElementById('gaze_y').textContent = gy.toFixed(3);
+        document.getElementById('use_eye').textContent = useEye ? 'TRUE (EYE)' : 'FALSE (MOUSE)';
+        document.getElementById('use_eye').className = useEye ? 'value error' : 'value ok';
+
+        // Compute patch position using CURRENT formula from main.ts
+        const cx = (gx * 0.5 + 0.5) * FULL_W;
+        const cy = (-gy * 0.5 + 0.5) * FULL_H;
+
+        document.getElementById('cx').textContent = cx.toFixed(1);
+        document.getElementById('cy').textContent = cy.toFixed(1);
+
+        const dx = Math.floor(clamp(cx - PATCH_W / 2, 0, FULL_W - PATCH_W));
+        const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
+
+        document.getElementById('dx').textContent = dx;
+        document.getElementById('dy').textContent = dy;
+
+        // Corner tests
+        const testTL = (gx < -0.8 && gy > 0.8);  // TOP-LEFT: x=-1, y=+1
+        const testTR = (gx > 0.8 && gy > 0.8);   // TOP-RIGHT: x=+1, y=+1
+        const testBL = (gx < -0.8 && gy < -0.8); // BOTTOM-LEFT: x=-1, y=-1
+        const testBR = (gx > 0.8 && gy < -0.8);  // BOTTOM-RIGHT: x=+1, y=-1
+
+        // TOP-LEFT test
+        if (testTL) {
+          const isCorrect = (dy < 20);
+          const msg = `dy=${dy} ${isCorrect ? '✓ CORRECT' : '✗ WRONG (expected ≈0)'}`;
+          document.getElementById('test_tl').textContent = 'TOP-LEFT: ' + msg;
+          document.getElementById('test_tl').className = isCorrect ? 'ok' : 'error';
+          addLog(`🔴 TOP-LEFT: ${msg}`, isCorrect ? '#0f0' : '#f00');
+        } else {
+          document.getElementById('test_tl').textContent = 'TOP-LEFT: -';
+          document.getElementById('test_tl').className = 'value';
+        }
+
+        // TOP-RIGHT test
+        if (testTR) {
+          const isCorrect = (dy < 20);
+          const msg = `dy=${dy} ${isCorrect ? '✓ CORRECT' : '✗ WRONG (expected ≈0)'}`;
+          document.getElementById('test_tr').textContent = 'TOP-RIGHT: ' + msg;
+          document.getElementById('test_tr').className = isCorrect ? 'ok' : 'error';
+          addLog(`🟢 TOP-RIGHT: ${msg}`, isCorrect ? '#0f0' : '#f00');
+        } else {
+          document.getElementById('test_tr').textContent = 'TOP-RIGHT: -';
+          document.getElementById('test_tr').className = 'value';
+        }
+
+        // BOTTOM-LEFT test
+        if (testBL) {
+          const isCorrect = (dy > 60);
+          const msg = `dy=${dy} ${isCorrect ? '✓ CORRECT' : '✗ WRONG (expected ≈80)'}`;
+          document.getElementById('test_bl').textContent = 'BOTTOM-LEFT: ' + msg;
+          document.getElementById('test_bl').className = isCorrect ? 'ok' : 'error';
+          addLog(`🔵 BOTTOM-LEFT: ${msg}`, isCorrect ? '#0f0' : '#f00');
+        } else {
+          document.getElementById('test_bl').textContent = 'BOTTOM-LEFT: -';
+          document.getElementById('test_bl').className = 'value';
+        }
+
+        // BOTTOM-RIGHT test
+        if (testBR) {
+          const isCorrect = (dy > 60);
+          const msg = `dy=${dy} ${isCorrect ? '✓ CORRECT' : '✗ WRONG (expected ≈80)'}`;
+          document.getElementById('test_br').textContent = 'BOTTOM-RIGHT: ' + msg;
+          document.getElementById('test_br').className = isCorrect ? 'ok' : 'error';
+          addLog(`🟡 BOTTOM-RIGHT: ${msg}`, isCorrect ? '#0f0' : '#f00');
+        } else {
+          document.getElementById('test_br').textContent = 'BOTTOM-RIGHT: -';
+          document.getElementById('test_br').className = 'value';
+        }
+
+      } catch (e) {
+        addLog('❌ Error: ' + e.message, '#f00');
+      }
+    }
+
+    // Update every 100ms for responsive feedback
+    setInterval(updateValues, 100);
+    addLog('✅ Diagnostic started - move mouse in demo!', '#0ff');
+  </script>
+</body>
+</html>

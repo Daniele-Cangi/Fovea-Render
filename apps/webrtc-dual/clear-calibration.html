@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Clear Calibration</title>
+  <style>
+    body {
+      font-family: 'Courier New', monospace;
+      background: #0a0a0a;
+      color: #0ff;
+      padding: 40px;
+      text-align: center;
+    }
+    button {
+      background: #f00;
+      color: #fff;
+      border: none;
+      padding: 20px 40px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 18px;
+      margin: 20px;
+    }
+    button:hover { background: #ff4444; }
+    .success {
+      color: #0f0;
+      font-size: 24px;
+      margin: 20px;
+    }
+    .info {
+      color: #ff0;
+      margin: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🗑️ Clear Old Calibration</h1>
+
+  <div class="info">
+    ⚠️ The mirror setting was changed from true → false.<br>
+    Old calibration coefficients are now invalid!<br>
+    You need to clear and re-calibrate.
+  </div>
+
+  <button onclick="clearCalibration()">🗑️ CLEAR CALIBRATION</button>
+  <button onclick="location.href='/'">← Back to Demo</button>
+
+  <div id="result"></div>
+
+  <script>
+    function clearCalibration() {
+      try {
+        localStorage.removeItem('fovea.calib.v1');
+        document.getElementById('result').innerHTML =
+          '<div class="success">✅ Calibration cleared!<br>Now go to demo and press C to re-calibrate with correct mirror setting.</div>';
+      } catch (e) {
+        document.getElementById('result').innerHTML =
+          '<div style="color:#f00">❌ Error: ' + e.message + '</div>';
+      }
+    }
+
+    // Check if calibration exists
+    window.addEventListener('load', () => {
+      const calib = localStorage.getItem('fovea.calib.v1');
+      if (calib) {
+        document.getElementById('result').innerHTML =
+          '<div class="info">📋 Found old calibration in storage. Click button to clear it.</div>';
+      } else {
+        document.getElementById('result').innerHTML =
+          '<div class="success">✅ No calibration found. You\'re good to go!</div>';
+      }
+    });
+  </script>
+</body>
+</html>

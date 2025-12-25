@@ -1045,8 +1045,8 @@ console.log("Canvases initialized:", {
 
 // show canvases at friendly size
 cLow.style.width = "420px"; cLow.style.height = "236px";
-cPatch.style.width = "420px"; cPatch.style.height = "420px";
-cOut.style.width = "860px"; cOut.style.height = "484px";
+cPatch.style.width = "640px"; cPatch.style.height = "640px"; // Larger patch stream for visibility
+cOut.style.width = "640px"; cOut.style.height = "360px"; // Smaller receiver
 
 // ---------- GAZE (eye tracking + mouse fallback) ----------
 const gazeNDC = new THREE.Vector2(0, 0);
@@ -1063,6 +1063,13 @@ let patchInit = false;
 let eyeLock = false;
 const ENTER_CONF = 0.35;
 const EXIT_CONF = 0.22;
+
+// ---------- WORKLOAD ENCODER STATE ----------
+let patchMode = 0; // 0=dark, 1=text, 2=checkerboard+line, 3=temporal noise
+let cursorX = 0.5; // normalized 0-1
+let cursorY = 0.5; // normalized 0-1
+const ROI_W = Math.floor(PATCH_W * 0.6); // ROI width: 60% of patch canvas
+const ROI_H = Math.floor(PATCH_H * 0.6); // ROI height: 60% of patch canvas
 
 // ---------- META BINARY ENCODER/DECODER ----------
 const META_VER = 1;
@@ -1137,6 +1144,10 @@ function tryDecodeMetaBinary(data: any) {
 // toggle per demo enterprise (L = compare)
 window.addEventListener("keydown", (e) => {
   if (e.key.toLowerCase() === "l") LOD_ON = !LOD_ON;
+  if (e.key.toLowerCase() === "m") {
+    patchMode = (patchMode + 1) % 4;
+    telEvent("workload_mode", { patchMode });
+  }
 });
 
 window.addEventListener("mousemove", (e) => {
@@ -1150,6 +1161,10 @@ window.addEventListener("mousemove", (e) => {
     THREE.MathUtils.clamp(nx, -1, 1),
     THREE.MathUtils.clamp(ny, -1, 1)
   );
+  
+  // Update cursor position for workload encoder (normalized 0-1)
+  cursorX = THREE.MathUtils.clamp(x, 0, 1);
+  cursorY = THREE.MathUtils.clamp(y, 0, 1);
 });
 
 // ---------- SCENE (fill-rate heavy points additive) ----------
@@ -1312,20 +1327,56 @@ const { scene, camera, update, matNear, matFar, pointsFar, farCount, N } = makeS
 
 console.log("Scene created:", { farCount, N, totalPoints: N });
 
+// Add LARGE visual corner markers for testing (visible in 3D scene)
+// These are HUGE so they're visible even in the small LOW stream
+const markerGeometry = new THREE.SphereGeometry(0.8, 32, 32); // Much bigger!
+const testMarkers = [
+  { color: 0xff0000, position: [-5, 4, 2], name: "TOP-LEFT" },      // Red - closer to camera
+  { color: 0x00ff00, position: [5, 4, 2], name: "TOP-RIGHT" },      // Green
+  { color: 0x0000ff, position: [-5, -4, 2], name: "BOTTOM-LEFT" },  // Blue
+  { color: 0xffff00, position: [5, -4, 2], name: "BOTTOM-RIGHT" }   // Yellow
+];
+
+testMarkers.forEach(m => {
+  // Main sphere
+  const material = new THREE.MeshBasicMaterial({
+    color: m.color,
+    transparent: false,
+    depthTest: true
+  });
+  const marker = new THREE.Mesh(markerGeometry, material);
+  marker.position.set(m.position[0], m.position[1], m.position[2]);
+  marker.name = m.name;
+  scene.add(marker);
+
+  // Add a glowing ring around it for better visibility
+  const ringGeometry = new THREE.RingGeometry(0.9, 1.1, 32);
+  const ringMaterial = new THREE.MeshBasicMaterial({
+    color: m.color,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.6
+  });
+  const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+  ring.position.set(m.position[0], m.position[1], m.position[2]);
+  ring.lookAt(0, 0, 10); // Face the camera
+  scene.add(ring);
+});
+
 // ---------- SENDER RENDERERS ----------
 const rLow = new THREE.WebGLRenderer({ canvas: cLow, antialias: true, alpha: false, powerPreference: "high-performance" });
 rLow.setSize(LOW_W, LOW_H, false);
 rLow.setPixelRatio(1);
 
-const rPatch = new THREE.WebGLRenderer({ canvas: cPatch, antialias: true, alpha: false, powerPreference: "high-performance" });
-rPatch.setSize(PATCH_W, PATCH_H, false);
-rPatch.setPixelRatio(1);
+// PATCH: Use 2D canvas for workload encoder (replaces WebGL)
+const ctxPatch = cPatch.getContext("2d", { alpha: false })!;
+if (!ctxPatch) throw new Error("Failed to get 2D context for cPatch");
 
 const tLow = new GpuTimer(rLow);
-const tPatch = new GpuTimer(rPatch);
+// Note: tPatch not used for 2D canvas (no GPU timing available)
 
 // ---------- GAZE PROVIDER (MediaPipe) ----------
-const gaze = new MediapipeGazeProvider({ mirrorX: true, smoothAlpha: 0.18 });
+const gaze = new MediapipeGazeProvider({ mirrorX: false, smoothAlpha: 0.18 });
 gaze.loadCalibrationFromStorage(); // se c'è, parte già calibrato
 gaze.start().catch(err => {
   console.warn("Gaze provider failed, using mouse only:", err);
@@ -1716,7 +1767,7 @@ function attachVideosIfReady() {
 // ---------- SENDER META + PATCH VIEWOFFSET ----------
 function computePatchRectTopLeft(gaze: THREE.Vector2) {
   const cx = (gaze.x * 0.5 + 0.5) * FULL_W;
-  const cy = (-gaze.y * 0.5 + 0.5) * FULL_H; // top-left origin
+  const cy = (-gaze.y * 0.5 + 0.5) * FULL_H; // top-left origin (NDC Y+ is up, screen Y+ is down)
 
   const dx = Math.floor(clamp(cx - PATCH_W / 2, 0, FULL_W - PATCH_W));
   const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
@@ -1745,7 +1796,9 @@ function computePatchRectTopLeft(gaze: THREE.Vector2) {
   );
 
   patchCam.clearViewOffset();
-  patchCam.setViewOffset(FULL_W, FULL_H, x0, y0, PATCH_W, PATCH_H);
+  // Convert y0 from top-left origin (screen coords) to bottom-left origin (OpenGL/Three.js coords)
+  const y0_gl = FULL_H - y0 - PATCH_H;
+  patchCam.setViewOffset(FULL_W, FULL_H, x0, y0_gl, PATCH_W, PATCH_H);
   patchCam.updateProjectionMatrix();
 }
 
@@ -1913,23 +1966,152 @@ function tick(t: number) {
     }
   }
 
-  // ---- LOW PASS ----
+  // ---- LOW PASS (Simplified: keep THREE.js but simpler) ----
+  // Use simple THREE.js scene (already configured for low bitrate)
   setPass(gazeNDC, LOW_W / LOW_H, FOVEA_R, FEATHER, "low");
   if (tLow.supported) tLow.begin();
   rLow.render(scene, camera);
   if (tLow.supported) tLow.end();
   const lowGpu = tLow.poll();
 
-  // ---- PATCH PASS ----
-  // convert fovea radius to patch NDC scale: r_patch ≈ r_full / rectWidth
-  const rPatchNDC = Math.min(0.95, FOVEA_R / patchRectN.z);
-  const fPatch = Math.min(0.35, FEATHER / patchRectN.z);
-
-  setPass(gazePatchNDC, PATCH_W / PATCH_H, rPatchNDC, fPatch, "patch");
-  if (tPatch.supported) tPatch.begin();
-  rPatch.render(scene, patchCam);
-  if (tPatch.supported) tPatch.end();
-  const patchGpu = tPatch.poll();
+  // ---- PATCH PASS (2D Canvas Workload Encoder) ----
+  // Clear black background
+  ctxPatch.fillStyle = "#000000";
+  ctxPatch.fillRect(0, 0, PATCH_W, PATCH_H);
+  
+  // Calculate ROI position (centered on cursor, scaled to patch canvas)
+  // Use gazeNDC converted to patch canvas coordinates (0-1)
+  const patchCursorX = (gazeNDC.x + 1) * 0.5; // Convert NDC (-1..1) to (0..1)
+  const patchCursorY = (-gazeNDC.y + 1) * 0.5; // Flip Y for canvas coordinates
+  
+  const roiW = ROI_W;
+  const roiH = ROI_H;
+  const roiX = Math.floor((patchCursorX * PATCH_W) - roiW / 2);
+  const roiY = Math.floor((patchCursorY * PATCH_H) - roiH / 2);
+  
+  // Clamp ROI to canvas bounds
+  const roiXClamped = Math.max(0, Math.min(roiX, PATCH_W - roiW));
+  const roiYClamped = Math.max(0, Math.min(roiY, PATCH_H - roiH));
+  
+  // Render based on mode
+  if (patchMode === 0) {
+    // Mode 0: Dark fill (minimal bitrate) - but make it visible
+    ctxPatch.fillStyle = "#222222";
+    ctxPatch.fillRect(roiXClamped, roiYClamped, roiW, roiH);
+    
+    // Add subtle border even in mode 0 for visibility
+    ctxPatch.strokeStyle = "#444444";
+    ctxPatch.lineWidth = 2;
+    ctxPatch.strokeRect(roiXClamped, roiYClamped, roiW, roiH);
+    
+    // Add text to show it's working
+    ctxPatch.fillStyle = "#888888";
+    ctxPatch.font = "bold 24px ui-monospace, monospace";
+    ctxPatch.textAlign = "center";
+    ctxPatch.textBaseline = "middle";
+    ctxPatch.fillText("MODE 0: MINIMAL", roiXClamped + roiW / 2, roiYClamped + roiH / 2);
+  } else if (patchMode === 1) {
+    // Mode 1: Scrolling white text on dark (subpixel edges) - make it brighter
+    ctxPatch.save();
+    ctxPatch.fillStyle = "#111111";
+    ctxPatch.fillRect(roiXClamped, roiYClamped, roiW, roiH);
+    
+    ctxPatch.fillStyle = "#ffffff";
+    ctxPatch.font = "bold 20px ui-monospace, monospace";
+    ctxPatch.textAlign = "left";
+    ctxPatch.textBaseline = "top";
+    
+    const scrollY = (timeSec * 50) % (roiH + 60) - 30;
+    const text = "The quick brown fox jumps over the lazy dog. 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    ctxPatch.fillText(text, roiXClamped + 10, roiYClamped + scrollY);
+    ctxPatch.fillText(text, roiXClamped + 10, roiYClamped + scrollY - 40);
+    ctxPatch.fillText(text, roiXClamped + 10, roiYClamped + scrollY - 80);
+    
+    ctxPatch.restore();
+  } else if (patchMode === 2) {
+    // Mode 2: Checkerboard + rotating line - make checkerboard more visible
+    ctxPatch.save();
+    
+    // Checkerboard with higher contrast
+    const cellSize = 20;
+    ctxPatch.fillStyle = "#ffffff";
+    for (let y = 0; y < roiH; y += cellSize) {
+      for (let x = 0; x < roiW; x += cellSize) {
+        const cellX = Math.floor((roiXClamped + x) / cellSize);
+        const cellY = Math.floor((roiYClamped + y) / cellSize);
+        if ((cellX + cellY) % 2 === 0) {
+          ctxPatch.fillRect(roiXClamped + x, roiYClamped + y, cellSize, cellSize);
+        }
+      }
+    }
+    
+    // Dark background for contrast
+    ctxPatch.fillStyle = "#000000";
+    for (let y = 0; y < roiH; y += cellSize) {
+      for (let x = 0; x < roiW; x += cellSize) {
+        const cellX = Math.floor((roiXClamped + x) / cellSize);
+        const cellY = Math.floor((roiYClamped + y) / cellSize);
+        if ((cellX + cellY) % 2 === 1) {
+          ctxPatch.fillRect(roiXClamped + x, roiYClamped + y, cellSize, cellSize);
+        }
+      }
+    }
+    
+    // Rotating line - thicker and brighter
+    const centerX = roiXClamped + roiW / 2;
+    const centerY = roiYClamped + roiH / 2;
+    const angle = timeSec * 3;
+    const radius = Math.min(roiW, roiH) * 0.45;
+    ctxPatch.strokeStyle = "#ff0000";
+    ctxPatch.lineWidth = 4;
+    ctxPatch.beginPath();
+    ctxPatch.moveTo(centerX, centerY);
+    ctxPatch.lineTo(
+      centerX + Math.cos(angle) * radius,
+      centerY + Math.sin(angle) * radius
+    );
+    ctxPatch.stroke();
+    
+    // Add center dot
+    ctxPatch.fillStyle = "#ff0000";
+    ctxPatch.beginPath();
+    ctxPatch.arc(centerX, centerY, 4, 0, Math.PI * 2);
+    ctxPatch.fill();
+    
+    ctxPatch.restore();
+  } else if (patchMode === 3) {
+    // Mode 3: Temporal noise - make it brighter and more visible
+    const imageData = ctxPatch.createImageData(roiW, roiH);
+    const data = imageData.data;
+    const noise = Math.sin(timeSec * 15) * 0.5 + 0.5;
+    
+    for (let i = 0; i < data.length; i += 4) {
+      const val = Math.floor(Math.random() * 255);
+      const brightness = Math.floor(noise * 200 + 55); // 55-255 range
+      data[i] = val;     // R
+      data[i + 1] = val; // G
+      data[i + 2] = val; // B
+      data[i + 3] = brightness; // A (use brightness for alpha to create pulsing effect)
+    }
+    
+    ctxPatch.putImageData(imageData, roiXClamped, roiYClamped);
+  }
+  
+  // Debug: Draw ROI border in all modes to make it visible
+  ctxPatch.strokeStyle = patchMode === 0 ? "#333333" : "#00ff00";
+  ctxPatch.lineWidth = patchMode === 0 ? 1 : 3;
+  ctxPatch.strokeRect(roiXClamped, roiYClamped, roiW, roiH);
+  
+  // Add mode indicator text in corner
+  ctxPatch.save();
+  ctxPatch.fillStyle = "#ffffff";
+  ctxPatch.font = "bold 20px ui-monospace, monospace";
+  ctxPatch.textAlign = "left";
+  ctxPatch.textBaseline = "top";
+  ctxPatch.fillText(`Mode ${patchMode}`, 10, 10);
+  ctxPatch.restore();
+  
+  const patchGpu = null; // 2D canvas doesn't have GPU timing
   
   // Debug: log ogni 60 frame
   if (frame % 60 === 0) {
@@ -1978,6 +2160,10 @@ function tick(t: number) {
       // Update TEL for allocator access (before telemetry sample)
       TEL.useEye = useEye;
       TEL.gazeConf = useEye ? gf.conf : 0;
+      
+      // Calculate ROI size for telemetry (same as in PATCH rendering)
+      const telRoiW = ROI_W;
+      const telRoiH = ROI_H;
 
       telPush({
         t_ms: Math.round(t),
@@ -2001,6 +2187,11 @@ function tick(t: number) {
         fovea_r: +FOVEA_R.toFixed(4),
         feather: +FEATHER.toFixed(4),
         lod: !!LOD_ON,
+        
+        // workload encoder
+        patch_mode: patchMode,
+        roi_w: telRoiW,
+        roi_h: telRoiH,
 
         // governor
         gov_on: !!GOV.enabled,
@@ -2055,7 +2246,7 @@ patch:      ${PATCH_W}x${PATCH_H}
 LOD:        ${LOD_ON ? "ON" : "OFF"}
 FAR points: ${farCount}/${N}  (${(farCount/N*100).toFixed(1)}%)
 gpu low:    ${tLow.supported ? (lowGpu ?? 0).toFixed(2) : "…"} ms
-gpu patch:  ${tPatch.supported ? (patchGpu ?? 0).toFixed(2) : "…"} ms
+gpu patch:  ${patchGpu != null ? patchGpu.toFixed(2) : "N/A (2D)"} ms
 gov:        ${GOV.enabled ? "ON" : "OFF"}  tgt=${GOV.targetGpuMs.toFixed(1)}ms
 gpuΣ(ema):  ${GOV.emaGpuMs.toFixed(2)} ms   thr=${GOV.throttle.toFixed(2)}
 fovea:      r=${FOVEA_R.toFixed(3)} f=${FEATHER.toFixed(3)}
@@ -2068,8 +2259,12 @@ loss worst:  ${TEL.lossPct != null ? TEL.lossPct.toFixed(2) : "…"}%
 rtt:         ${BW.rttMs ?? "…"} ms
 ice aob:     ${TEL.aobKbps ?? "…"} kbps  ice_rtt: ${TEL.iceRttMs ?? "…"} ms
 tele:       ${TEL.enabled ? "ON" : "OFF"}  lines=${TEL.lines.length}
-keys:       B toggle | 1 mobile | 2 balanced | 3 lan | [ ] adjust cap | T tele | D download | X clear
+keys:       B toggle | 1 mobile | 2 balanced | 3 lan | [ ] adjust cap | T tele | D download | X clear | M workload mode
+workload:   patch mode=${patchMode} (0=dark 1=text 2=checker 3=noise) ROI=${Math.min(ROI_W, PATCH_W)}x${Math.min(ROI_H, PATCH_H)}
 eye conf:   ${gf.conf.toFixed(2)} ${gf.hasIris ? "iris" : "head"}
+
+🎯 TEST MARKERS: Guarda le 4 sfere colorate (🔴🟢🔵🟡) agli angoli.
+   Se il tracking funziona, la sfera DEVE apparire nel PATCH (destra)!
 gazeNDC:    ${gazeNDC.x.toFixed(3)}, ${gazeNDC.y.toFixed(3)}`;
     } catch (err) {
       console.error("Error updating sender stats:", err);

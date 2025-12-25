@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Debug Values - Real-time</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: #0f0;
+      font-family: 'Courier New', monospace;
+      padding: 20px;
+      font-size: 14px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 200px 150px 400px;
+      gap: 10px;
+      margin: 20px 0;
+    }
+    .label { color: #0ff; font-weight: bold; }
+    .value { color: #0f0; }
+    .formula { color: #ff0; font-size: 12px; }
+    .section {
+      border-top: 1px solid #333;
+      padding-top: 10px;
+      margin-top: 10px;
+    }
+    .error { color: #f00; }
+    .ok { color: #0f0; }
+  </style>
+</head>
+<body>
+  <h1>🔍 Real-Time Debug Values</h1>
+  <p>Apri il demo su <a href="http://localhost:5175" target="_blank" style="color: #0ff;">http://localhost:5175</a> e muovi il mouse</p>
+  <p style="color: #ff0;">I valori si aggiornano ogni 500ms leggendo dal pannello stats</p>
+
+  <div class="grid">
+    <div class="label">Description</div>
+    <div class="label">Value</div>
+    <div class="label">Formula / Notes</div>
+
+    <div class="section label" style="grid-column: 1 / -1;">📍 Mouse Position (from stats)</div>
+
+    <div>gazeNDC.x</div>
+    <div class="value" id="gaze_x">-</div>
+    <div class="formula">From senderStats panel</div>
+
+    <div>gazeNDC.y</div>
+    <div class="value" id="gaze_y">-</div>
+    <div class="formula">+1 = TOP, -1 = BOTTOM (NDC convention)</div>
+
+    <div class="section label" style="grid-column: 1 / -1;">📐 Computed Patch Position</div>
+
+    <div>cx (expected)</div>
+    <div class="value" id="cx">-</div>
+    <div class="formula">cx = (gaze.x * 0.5 + 0.5) * 1280</div>
+
+    <div>cy (expected)</div>
+    <div class="value" id="cy">-</div>
+    <div class="formula">cy = (-gaze.y * 0.5 + 0.5) * 720</div>
+
+    <div>dx (patch left)</div>
+    <div class="value" id="dx">-</div>
+    <div class="formula">clamp(cx - 320, 0, 640)</div>
+
+    <div>dy (patch top)</div>
+    <div class="value" id="dy">-</div>
+    <div class="formula">clamp(cy - 320, 0, 80)</div>
+
+    <div class="section label" style="grid-column: 1 / -1;">✅ Verification (for mouse positions)</div>
+
+    <div>Mouse TOP-LEFT</div>
+    <div id="test_tl" class="value">-</div>
+    <div class="formula">gaze ≈ (-1, +1) → dy should be ≈ 0</div>
+
+    <div>Mouse TOP-RIGHT</div>
+    <div id="test_tr" class="value">-</div>
+    <div class="formula">gaze ≈ (+1, +1) → dy should be ≈ 0</div>
+
+    <div>Mouse BOTTOM-LEFT</div>
+    <div id="test_bl" class="value">-</div>
+    <div class="formula">gaze ≈ (-1, -1) → dy should be ≈ 80 (720-640)</div>
+
+    <div>Mouse BOTTOM-RIGHT</div>
+    <div id="test_br" class="value">-</div>
+    <div class="formula">gaze ≈ (+1, -1) → dy should be ≈ 80</div>
+  </div>
+
+  <div style="margin-top: 30px; padding: 15px; background: #1a1a1a; border: 1px solid #333;">
+    <strong style="color: #ff0;">🎯 HOW TO TEST:</strong><br>
+    1. Open main demo: <a href="http://localhost:5175" target="_blank" style="color: #0ff;">http://localhost:5175</a><br>
+    2. Move mouse to each corner<br>
+    3. Watch this page update with calculated values<br>
+    4. Check if dy values match expectations
+  </div>
+
+  <script>
+    const FULL_W = 1280;
+    const FULL_H = 720;
+    const PATCH_W = 640;
+    const PATCH_H = 640;
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function updateValues() {
+      try {
+        // Try to access stats from opener or current window
+        let statsText = null;
+
+        // Try current window first
+        const stats = document.getElementById('senderStats');
+        if (stats) {
+          statsText = stats.textContent;
+        }
+
+        // If not found, try to access from other windows (won't work due to CORS but worth trying)
+        if (!statsText) {
+          // Can't access other window's DOM due to same-origin policy
+          document.getElementById('gaze_x').textContent = 'Open demo in same window';
+          return;
+        }
+
+        // Parse gazeNDC values
+        const matchGaze = statsText.match(/gazeNDC:\s+([\-\d.]+),\s+([\-\d.]+)/);
+
+        if (matchGaze) {
+          const gx = parseFloat(matchGaze[1]);
+          const gy = parseFloat(matchGaze[2]);
+
+          document.getElementById('gaze_x').textContent = gx.toFixed(3);
+          document.getElementById('gaze_y').textContent = gy.toFixed(3);
+
+          // Compute patch position using CURRENT formula
+          const cx = (gx * 0.5 + 0.5) * FULL_W;
+          const cy = (-gy * 0.5 + 0.5) * FULL_H;
+
+          document.getElementById('cx').textContent = cx.toFixed(1);
+          document.getElementById('cy').textContent = cy.toFixed(1);
+
+          const dx = Math.floor(clamp(cx - PATCH_W / 2, 0, FULL_W - PATCH_W));
+          const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
+
+          document.getElementById('dx').textContent = dx;
+          document.getElementById('dy').textContent = dy;
+
+          // Verification tests
+          const testTL = (Math.abs(gx + 1) < 0.3 && Math.abs(gy - 1) < 0.3);
+          const testTR = (Math.abs(gx - 1) < 0.3 && Math.abs(gy - 1) < 0.3);
+          const testBL = (Math.abs(gx + 1) < 0.3 && Math.abs(gy + 1) < 0.3);
+          const testBR = (Math.abs(gx - 1) < 0.3 && Math.abs(gy + 1) < 0.3);
+
+          document.getElementById('test_tl').textContent = testTL ? `dy=${dy} ${dy < 20 ? '✓ OK' : '✗ WRONG'}` : '-';
+          document.getElementById('test_tl').className = testTL ? (dy < 20 ? 'ok' : 'error') : 'value';
+
+          document.getElementById('test_tr').textContent = testTR ? `dy=${dy} ${dy < 20 ? '✓ OK' : '✗ WRONG'}` : '-';
+          document.getElementById('test_tr').className = testTR ? (dy < 20 ? 'ok' : 'error') : 'value';
+
+          document.getElementById('test_bl').textContent = testBL ? `dy=${dy} ${dy > 60 ? '✓ OK' : '✗ WRONG'}` : '-';
+          document.getElementById('test_bl').className = testBL ? (dy > 60 ? 'ok' : 'error') : 'value';
+
+          document.getElementById('test_br').textContent = testBR ? `dy=${dy} ${dy > 60 ? '✓ OK' : '✗ WRONG'}` : '-';
+          document.getElementById('test_br').className = testBR ? (dy > 60 ? 'ok' : 'error') : 'value';
+        }
+      } catch (e) {
+        console.error('Error reading stats:', e);
+      }
+    }
+
+    // Try to read from demo page periodically
+    setInterval(updateValues, 500);
+
+    // Provide manual input for testing
+    document.addEventListener('DOMContentLoaded', () => {
+      document.body.insertAdjacentHTML('beforeend', `
+        <div style="margin-top: 30px; padding: 15px; background: #1a1a1a; border: 1px solid #0ff;">
+          <strong style="color: #0ff;">⌨️ MANUAL TEST:</strong><br>
+          Enter gaze values manually: <br><br>
+          gaze.x: <input type="number" id="manual_x" value="0" step="0.1" style="width: 80px; background: #000; color: #0f0; border: 1px solid #333; padding: 5px;">
+          gaze.y: <input type="number" id="manual_y" value="0" step="0.1" style="width: 80px; background: #000; color: #0f0; border: 1px solid #333; padding: 5px;">
+          <button onclick="manualTest()" style="background: #0ff; color: #000; border: none; padding: 5px 15px; cursor: pointer; margin-left: 10px;">Calculate</button>
+          <button onclick="runAllTests()" style="background: #ff0; color: #000; border: none; padding: 5px 15px; cursor: pointer; margin-left: 10px; font-weight: bold;">RUN ALL TESTS</button>
+          <div id="manual_result" style="margin-top: 15px; padding: 10px; background: #000; border: 1px solid #333; min-height: 50px; font-size: 13px;"></div>
+        </div>
+      `);
+    });
+
+    function manualTest() {
+      const gx = parseFloat(document.getElementById('manual_x').value);
+      const gy = parseFloat(document.getElementById('manual_y').value);
+
+      const cx = (gx * 0.5 + 0.5) * FULL_W;
+      const cy = (-gy * 0.5 + 0.5) * FULL_H;
+      const dx = Math.floor(clamp(cx - PATCH_W / 2, 0, FULL_W - PATCH_W));
+      const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
+
+      const result = `
+📊 <strong>RESULT for gaze = (${gx}, ${gy})</strong><br>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━<br>
+cx = ${cx.toFixed(1)} px<br>
+cy = ${cy.toFixed(1)} px<br>
+dx = ${dx} px (patch left)<br>
+dy = ${dy} px (patch top)<br>
+<br>
+<span style="color: #ff0;">Expected dy:</span><br>
+• If TOP (gy ≈ +1): dy should be ≈ 0<br>
+• If BOTTOM (gy ≈ -1): dy should be ≈ 80<br>
+<br>
+<span style="${Math.abs(gy - 1) < 0.2 ? (dy < 20 ? 'color: #0f0' : 'color: #f00') : Math.abs(gy + 1) < 0.2 ? (dy > 60 ? 'color: #0f0' : 'color: #f00') : 'color: #ff0'}">
+${Math.abs(gy - 1) < 0.2 ? (dy < 20 ? '✓ CORRECT (TOP)' : '✗ WRONG (should be near 0)') :
+  Math.abs(gy + 1) < 0.2 ? (dy > 60 ? '✓ CORRECT (BOTTOM)' : '✗ WRONG (should be near 80)') :
+  'ℹ️ Move to corner for test'}
+</span>
+      `;
+
+      document.getElementById('manual_result').innerHTML = result;
+    }
+
+    function runAllTests() {
+      const tests = [
+        { name: 'TOP-LEFT', x: -1, y: 1, expectedDy: 0 },
+        { name: 'TOP-RIGHT', x: 1, y: 1, expectedDy: 0 },
+        { name: 'BOTTOM-LEFT', x: -1, y: -1, expectedDy: 80 },
+        { name: 'BOTTOM-RIGHT', x: 1, y: -1, expectedDy: 80 },
+        { name: 'CENTER', x: 0, y: 0, expectedDy: 40 }
+      ];
+
+      let output = '<strong style="font-size: 16px; color: #ff0;">🧪 COMPLETE TEST RESULTS</strong><br>';
+      output += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━<br><br>';
+
+      tests.forEach(test => {
+        const cx = (test.x * 0.5 + 0.5) * FULL_W;
+        const cy = (-test.y * 0.5 + 0.5) * FULL_H;
+        const dx = Math.floor(clamp(cx - PATCH_W / 2, 0, FULL_W - PATCH_W));
+        const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
+
+        const tolerance = 10;
+        const isCorrect = Math.abs(dy - test.expectedDy) < tolerance;
+
+        output += `<div style="margin-bottom: 10px; padding: 8px; background: ${isCorrect ? '#001a00' : '#1a0000'}; border-left: 3px solid ${isCorrect ? '#0f0' : '#f00'};">`;
+        output += `<strong>${isCorrect ? '✓' : '✗'} ${test.name}</strong><br>`;
+        output += `gaze = (${test.x.toFixed(1)}, ${test.y.toFixed(1)}) → dy = <strong>${dy}</strong> (expected ≈ ${test.expectedDy})<br>`;
+        output += `<span style="font-size: 11px; color: #888;">cx=${cx.toFixed(1)}, cy=${cy.toFixed(1)}, dx=${dx}</span>`;
+        output += `</div>`;
+      });
+
+      output += '<br><strong style="color: #0ff;">📋 COPY THIS FOR DEVELOPER:</strong><br>';
+      output += '<textarea readonly style="width: 100%; height: 120px; background: #000; color: #0f0; border: 1px solid #0ff; padding: 10px; font-family: monospace; font-size: 12px;" onclick="this.select()">';
+
+      tests.forEach(test => {
+        const cy = (-test.y * 0.5 + 0.5) * FULL_H;
+        const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
+        output += `${test.name}: gaze.y=${test.y} → dy=${dy} (expected≈${test.expectedDy}) ${Math.abs(dy - test.expectedDy) < 10 ? '✓' : '✗'}\n`;
+      });
+
+      output += '</textarea>';
+
+      document.getElementById('manual_result').innerHTML = output;
+    }
+  </script>
+</body>
+</html>

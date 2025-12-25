@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Fullscreen Eye Tracking Test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      color: #fff;
+      font-family: Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    #container {
+      width: 100vw;
+      height: 100vh;
+      position: relative;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    #instructions {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(0,0,0,0.85);
+      border: 3px solid #0ff;
+      padding: 20px;
+      border-radius: 10px;
+      max-width: 400px;
+      z-index: 100;
+    }
+
+    #instructions h1 {
+      color: #ff0;
+      font-size: 24px;
+      margin-bottom: 15px;
+    }
+
+    #instructions p {
+      margin: 10px 0;
+      line-height: 1.6;
+    }
+
+    #instructions strong {
+      color: #0ff;
+    }
+
+    .marker-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px;
+      background: #1a1a1a;
+      border-radius: 5px;
+      margin: 5px 0;
+    }
+
+    .marker-color {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      border: 2px solid #fff;
+    }
+
+    #status {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.9);
+      border: 3px solid #0ff;
+      padding: 20px 40px;
+      border-radius: 10px;
+      text-align: center;
+      min-width: 500px;
+      z-index: 100;
+    }
+
+    #status h2 {
+      color: #0ff;
+      margin-bottom: 10px;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 15px;
+      margin-top: 15px;
+    }
+
+    .status-item {
+      background: #1a1a1a;
+      padding: 10px;
+      border-radius: 5px;
+      text-align: center;
+    }
+
+    .status-label {
+      color: #888;
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+
+    .status-value {
+      color: #0f0;
+      font-size: 20px;
+      font-weight: bold;
+    }
+
+    .corner-overlay {
+      position: absolute;
+      width: 200px;
+      height: 200px;
+      border: 4px dashed;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 48px;
+      pointer-events: none;
+      z-index: 10;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+
+    .corner-overlay.active {
+      opacity: 1;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.05); }
+    }
+
+    #top-left { top: 50px; left: 50px; border-color: #f00; background: rgba(255,0,0,0.1); }
+    #top-right { top: 50px; right: 50px; border-color: #0f0; background: rgba(0,255,0,0.1); }
+    #bottom-left { bottom: 50px; left: 50px; border-color: #00f; background: rgba(0,0,255,0.1); }
+    #bottom-right { bottom: 50px; right: 50px; border-color: #ff0; background: rgba(255,255,0,0.1); }
+
+    .hide { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <canvas id="canvas"></canvas>
+
+    <div id="instructions">
+      <h1>🎯 Test Eye Tracking Fullscreen</h1>
+      <p><strong>SETUP:</strong></p>
+      <p>1. Premi <strong>C</strong> per calibrare (segui i 9 punti)</p>
+      <p>2. Dopo calibrazione, guarda verso questi marker:</p>
+
+      <div class="marker-info">
+        <div class="marker-color" style="background: #f00;"></div>
+        <div>🔴 <strong>TOP-LEFT</strong> - Alto sinistra</div>
+      </div>
+      <div class="marker-info">
+        <div class="marker-color" style="background: #0f0;"></div>
+        <div>🟢 <strong>TOP-RIGHT</strong> - Alto destra</div>
+      </div>
+      <div class="marker-info">
+        <div class="marker-color" style="background: #00f;"></div>
+        <div>🔵 <strong>BOTTOM-LEFT</strong> - Basso sinistra</div>
+      </div>
+      <div class="marker-info">
+        <div class="marker-color" style="background: #ff0;"></div>
+        <div>🟡 <strong>BOTTOM-RIGHT</strong> - Basso destra</div>
+      </div>
+
+      <p style="margin-top: 15px; color: #ff0;"><strong>VERIFICA:</strong> Quando guardi un marker, il riquadro tratteggiato nell'angolo corrispondente deve illuminarsi!</p>
+    </div>
+
+    <!-- Corner overlays -->
+    <div id="top-left" class="corner-overlay">🔴</div>
+    <div id="top-right" class="corner-overlay">🟢</div>
+    <div id="bottom-left" class="corner-overlay">🔵</div>
+    <div id="bottom-right" class="corner-overlay">🟡</div>
+
+    <div id="status">
+      <h2>📊 Stato Tracking</h2>
+      <div class="status-grid">
+        <div class="status-item">
+          <div class="status-label">GazeNDC X</div>
+          <div class="status-value" id="gaze_x">0.00</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label">GazeNDC Y</div>
+          <div class="status-value" id="gaze_y">0.00</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label">Guardando verso</div>
+          <div class="status-value" id="looking">CENTER</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label">Eye Tracking</div>
+          <div class="status-value" id="eye_active">MOUSE</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { MediapipeGazeProvider } from '../../packages/gaze-mediapipe/src/MediapipeGazeProvider';
+
+    const canvas = document.getElementById('canvas');
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+
+    // Setup Three.js scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a0a);
+
+    const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
+    camera.position.z = 10;
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(W, H);
+    renderer.setPixelRatio(window.devicePixelRatio);
+
+    // Add test markers (LARGE spheres at corners)
+    const markerGeometry = new THREE.SphereGeometry(0.6, 32, 32);
+    const markers = [
+      { color: 0xff0000, position: [-5, 3.5, 0], name: "TOP-LEFT", id: "top-left" },
+      { color: 0x00ff00, position: [5, 3.5, 0], name: "TOP-RIGHT", id: "top-right" },
+      { color: 0x0000ff, position: [-5, -3.5, 0], name: "BOTTOM-LEFT", id: "bottom-left" },
+      { color: 0xffff00, position: [5, -3.5, 0], name: "BOTTOM-RIGHT", id: "bottom-right" }
+    ];
+
+    markers.forEach(m => {
+      const material = new THREE.MeshBasicMaterial({ color: m.color });
+      const sphere = new THREE.Mesh(markerGeometry, material);
+      sphere.position.set(...m.position);
+      sphere.userData = { name: m.name, id: m.id };
+      scene.add(sphere);
+
+      // Add ring
+      const ringGeometry = new THREE.RingGeometry(0.7, 0.9, 32);
+      const ringMaterial = new THREE.MeshBasicMaterial({
+        color: m.color,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.5
+      });
+      const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+      ring.position.set(...m.position);
+      ring.lookAt(0, 0, 10);
+      scene.add(ring);
+    });
+
+    // Add background stars
+    const starsGeometry = new THREE.BufferGeometry();
+    const starPositions = [];
+    for (let i = 0; i < 1000; i++) {
+      starPositions.push(
+        (Math.random() - 0.5) * 50,
+        (Math.random() - 0.5) * 50,
+        (Math.random() - 0.5) * 50 - 10
+      );
+    }
+    starsGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starPositions, 3));
+    const starsMaterial = new THREE.PointsMaterial({ color: 0x444444, size: 0.05 });
+    const stars = new THREE.Points(starsGeometry, starsMaterial);
+    scene.add(stars);
+
+    // Initialize gaze provider
+    const gaze = new MediapipeGazeProvider({ mirrorX: false, smoothAlpha: 0.18 });
+    await gaze.init();
+
+    const gazeNDC = new THREE.Vector2(0, 0);
+    const mouseNDC = new THREE.Vector2(0, 0);
+
+    // Mouse tracking
+    window.addEventListener('mousemove', (e) => {
+      const x = (e.clientX / W) * 2 - 1;
+      const y = -((e.clientY / H) * 2 - 1);
+      mouseNDC.set(x, y);
+    });
+
+    // Calibration
+    window.addEventListener('keydown', (e) => {
+      if (e.key.toLowerCase() === 'c') {
+        alert('Calibration would start here. For now, move your mouse to test!');
+      }
+    });
+
+    // Update loop
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const gf = gaze.getFrame();
+      const useEye = gf.conf > 0.3;
+
+      if (useEye) {
+        gazeNDC.set(gf.gazeX, gf.gazeY);
+        document.getElementById('eye_active').textContent = 'EYES ✓';
+        document.getElementById('eye_active').style.color = '#0f0';
+      } else {
+        gazeNDC.copy(mouseNDC);
+        document.getElementById('eye_active').textContent = 'MOUSE';
+        document.getElementById('eye_active').style.color = '#ff0';
+      }
+
+      // Update UI
+      document.getElementById('gaze_x').textContent = gazeNDC.x.toFixed(2);
+      document.getElementById('gaze_y').textContent = gazeNDC.y.toFixed(2);
+
+      // Determine which corner is being looked at
+      let looking = 'CENTER';
+      let activeId = null;
+
+      if (gazeNDC.x < -0.3 && gazeNDC.y > 0.3) {
+        looking = 'TOP-LEFT 🔴';
+        activeId = 'top-left';
+      } else if (gazeNDC.x > 0.3 && gazeNDC.y > 0.3) {
+        looking = 'TOP-RIGHT 🟢';
+        activeId = 'top-right';
+      } else if (gazeNDC.x < -0.3 && gazeNDC.y < -0.3) {
+        looking = 'BOTTOM-LEFT 🔵';
+        activeId = 'bottom-left';
+      } else if (gazeNDC.x > 0.3 && gazeNDC.y < -0.3) {
+        looking = 'BOTTOM-RIGHT 🟡';
+        activeId = 'bottom-right';
+      }
+
+      document.getElementById('looking').textContent = looking;
+
+      // Activate corner overlays
+      ['top-left', 'top-right', 'bottom-left', 'bottom-right'].forEach(id => {
+        const el = document.getElementById(id);
+        if (id === activeId) {
+          el.classList.add('active');
+        } else {
+          el.classList.remove('active');
+        }
+      });
+
+      // Rotate scene slowly
+      stars.rotation.y += 0.0001;
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // Handle resize
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    });
+  </script>
+</body>
+</html>

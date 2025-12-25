@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Gaze Axes Test</title>
+  <style>
+    body {
+      margin: 0;
+      background: #0a0a0a;
+      color: #0ff;
+      font-family: 'Courier New', monospace;
+      overflow: hidden;
+    }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.8);
+      padding: 15px;
+      border: 1px solid #0ff;
+      z-index: 100;
+    }
+    #canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
+    .instruction {
+      color: #ff0;
+      font-size: 18px;
+      margin: 10px 0;
+    }
+    .pass { color: #0f0; }
+    .fail { color: #f00; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <h2>🎯 Gaze Axes Verification</h2>
+    <div class="instruction">Move your eyes/mouse to test tracking:</div>
+    <div>
+      <strong>Expected Behavior:</strong><br>
+      • Look RIGHT → Cursor moves RIGHT ✓<br>
+      • Look LEFT → Cursor moves LEFT ✓<br>
+      • Look UP → Cursor moves UP ✓<br>
+      • Look DOWN → Cursor moves DOWN ✓
+    </div>
+    <div id="coords" style="margin-top: 10px; font-size: 14px;">
+      gazeX: <span id="gx">0.00</span> (R+ L-)<br>
+      gazeY: <span id="gy">0.00</span> (U+ D-)<br>
+      <span id="quadrant" style="color: #ff0;">Quadrant: CENTER</span>
+    </div>
+    <button onclick="location.href='/'" style="margin-top: 10px; padding: 5px 10px; cursor: pointer;">← Back to Demo</button>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let mouseX = 0, mouseY = 0;
+
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      mouseX = (e.clientX / rect.width) * 2 - 1;
+      mouseY = -((e.clientY / rect.height) * 2 - 1); // Flip Y for NDC
+    });
+
+    function draw() {
+      const w = canvas.width;
+      const h = canvas.height;
+
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, w, h);
+
+      // Draw axes
+      ctx.strokeStyle = '#444';
+      ctx.lineWidth = 2;
+
+      // X axis
+      ctx.beginPath();
+      ctx.moveTo(0, h/2);
+      ctx.lineTo(w, h/2);
+      ctx.stroke();
+
+      // Y axis
+      ctx.beginPath();
+      ctx.moveTo(w/2, 0);
+      ctx.lineTo(w/2, h);
+      ctx.stroke();
+
+      // Draw quadrant labels
+      ctx.fillStyle = '#666';
+      ctx.font = '14px monospace';
+      ctx.fillText('X+', w - 30, h/2 - 10);
+      ctx.fillText('X-', 10, h/2 - 10);
+      ctx.fillText('Y+', w/2 + 10, 20);
+      ctx.fillText('Y-', w/2 + 10, h - 10);
+
+      ctx.fillText('RIGHT →', w - 80, h/2 + 25);
+      ctx.fillText('← LEFT', 10, h/2 + 25);
+      ctx.fillText('↑ UP', w/2 - 30, 20);
+      ctx.fillText('DOWN ↓', w/2 - 40, h - 10);
+
+      // Draw cursor (convert NDC to screen)
+      const cx = (mouseX * 0.5 + 0.5) * w;
+      const cy = (-mouseY * 0.5 + 0.5) * h; // Flip back for screen coordinates
+
+      // Cursor circle
+      ctx.fillStyle = '#0ff';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 15, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Crosshair
+      ctx.strokeStyle = '#0ff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - 25, cy);
+      ctx.lineTo(cx + 25, cy);
+      ctx.moveTo(cx, cy - 25);
+      ctx.lineTo(cx, cy + 25);
+      ctx.stroke();
+
+      // Update info
+      document.getElementById('gx').textContent = mouseX.toFixed(2);
+      document.getElementById('gy').textContent = mouseY.toFixed(2);
+
+      // Determine quadrant
+      let quad = '';
+      if (Math.abs(mouseX) < 0.1 && Math.abs(mouseY) < 0.1) {
+        quad = 'CENTER';
+      } else {
+        if (mouseX > 0.1) quad += 'RIGHT ';
+        if (mouseX < -0.1) quad += 'LEFT ';
+        if (mouseY > 0.1) quad += 'UP';
+        if (mouseY < -0.1) quad += 'DOWN';
+      }
+      document.getElementById('quadrant').textContent = 'Quadrant: ' + (quad || 'CENTER');
+
+      requestAnimationFrame(draw);
+    }
+
+    draw();
+  </script>
+</body>
+</html>

@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Visual Eye Tracking Test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      color: #0f0;
+      font-family: 'Courier New', monospace;
+      overflow: hidden;
+    }
+    #container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    #testCanvas {
+      border: 3px solid #0ff;
+      background: #1a1a1a;
+      cursor: crosshair;
+    }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.85);
+      border: 2px solid #0ff;
+      padding: 15px;
+      border-radius: 8px;
+      font-size: 14px;
+      max-width: 350px;
+      z-index: 100;
+    }
+    .stat-row {
+      display: grid;
+      grid-template-columns: 150px 1fr;
+      gap: 10px;
+      padding: 3px 0;
+      border-bottom: 1px solid #333;
+    }
+    .label { color: #0ff; font-weight: bold; }
+    .value { color: #0f0; }
+    .error { color: #f00; }
+    .ok { color: #0f0; }
+    .warning { color: #ff0; }
+    h1 { color: #ff0; font-size: 18px; margin-bottom: 10px; }
+    #instructions {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      right: 10px;
+      background: rgba(0,255,255,0.15);
+      border: 2px solid #0ff;
+      padding: 15px;
+      border-radius: 8px;
+      font-size: 13px;
+      text-align: center;
+    }
+    #instructions strong { color: #ff0; }
+    #instructions p { margin: 8px 0; color: #0ff; }
+    .marker {
+      position: absolute;
+      width: 40px;
+      height: 40px;
+      border: 3px solid;
+      border-radius: 50%;
+      font-size: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      pointer-events: none;
+      text-shadow: 0 0 5px #000;
+    }
+    .corner-label {
+      position: absolute;
+      font-size: 16px;
+      font-weight: bold;
+      padding: 8px 12px;
+      border-radius: 5px;
+      pointer-events: none;
+      text-shadow: 0 0 8px #000;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <canvas id="testCanvas" width="1280" height="720"></canvas>
+
+    <div id="info">
+      <h1>🎯 Visual Tracking Test</h1>
+      <div class="stat-row">
+        <div class="label">Mode:</div>
+        <div class="value" id="mode">MOUSE</div>
+      </div>
+      <div class="stat-row">
+        <div class="label">Gaze NDC:</div>
+        <div class="value" id="gaze_ndc">-</div>
+      </div>
+      <div class="stat-row">
+        <div class="label">Patch Center:</div>
+        <div class="value" id="patch_center">-</div>
+      </div>
+      <div class="stat-row">
+        <div class="label">Patch Rect:</div>
+        <div class="value" id="patch_rect">-</div>
+      </div>
+      <div class="stat-row">
+        <div class="label">Status:</div>
+        <div class="value ok" id="status">Ready</div>
+      </div>
+    </div>
+
+    <div id="instructions">
+      <strong>🔍 COME TESTARE:</strong>
+      <p><strong style="color: #0ff;">1. GUARDA / MUOVI MOUSE</strong> verso uno dei 4 marker colorati agli angoli</p>
+      <p><strong style="color: #0ff;">2. VERIFICA</strong> che il rettangolo BLU (patch) si posizioni nell'angolo corretto</p>
+      <p><strong style="color: #ff0;">3. IL MARKER DEVE ESSERE DENTRO IL RETTANGOLO BLU!</strong></p>
+      <p style="font-size: 11px; color: #888;">Se il marker è fuori dal rettangolo blu, c'è ancora un errore nel tracking</p>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('testCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const FULL_W = 1280;
+    const FULL_H = 720;
+    const PATCH_W = 640;
+    const PATCH_H = 640;
+
+    let mouseNDC = { x: 0, y: 0 };
+    let gazeNDC = { x: 0, y: 0 };
+    let patchRect = { x: 0, y: 0 };
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    // Corner markers with emojis
+    const markers = [
+      { name: 'TOP-LEFT', x: 100, y: 100, color: '#f00', emoji: '🔴', ndcExpected: { x: -0.84, y: 0.72 } },
+      { name: 'TOP-RIGHT', x: FULL_W - 100, y: 100, color: '#0f0', emoji: '🟢', ndcExpected: { x: 0.84, y: 0.72 } },
+      { name: 'BOTTOM-LEFT', x: 100, y: FULL_H - 100, color: '#00f', emoji: '🔵', ndcExpected: { x: -0.84, y: -0.72 } },
+      { name: 'BOTTOM-RIGHT', x: FULL_W - 100, y: FULL_H - 100, color: '#ff0', emoji: '🟡', ndcExpected: { x: 0.84, y: -0.72 } }
+    ];
+
+    function drawScene() {
+      // Clear
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(0, 0, FULL_W, FULL_H);
+
+      // Draw grid
+      ctx.strokeStyle = '#2a2a2a';
+      ctx.lineWidth = 1;
+      for (let x = 0; x <= FULL_W; x += 64) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, FULL_H);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= FULL_H; y += 64) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(FULL_W, y);
+        ctx.stroke();
+      }
+
+      // Draw center crosshair
+      ctx.strokeStyle = '#444';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(FULL_W/2 - 50, FULL_H/2);
+      ctx.lineTo(FULL_W/2 + 50, FULL_H/2);
+      ctx.moveTo(FULL_W/2, FULL_H/2 - 50);
+      ctx.lineTo(FULL_W/2, FULL_H/2 + 50);
+      ctx.stroke();
+
+      // Draw corner markers
+      markers.forEach(marker => {
+        // Circle
+        ctx.strokeStyle = marker.color;
+        ctx.fillStyle = marker.color + '33';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.arc(marker.x, marker.y, 30, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        // Emoji
+        ctx.font = 'bold 24px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(marker.emoji, marker.x, marker.y);
+
+        // Label
+        ctx.font = 'bold 12px monospace';
+        let offsetY = marker.y < FULL_H/2 ? 55 : -55;
+        ctx.fillStyle = marker.color;
+        ctx.fillText(marker.name, marker.x, marker.y + offsetY);
+      });
+
+      // Draw patch rectangle (what should be captured)
+      ctx.strokeStyle = '#0ff';
+      ctx.lineWidth = 4;
+      ctx.setLineDash([10, 5]);
+      ctx.strokeRect(patchRect.x, patchRect.y, PATCH_W, PATCH_H);
+      ctx.setLineDash([]);
+
+      // Draw patch rect label
+      ctx.fillStyle = '#0ff';
+      ctx.font = 'bold 16px monospace';
+      ctx.fillText('PATCH AREA', patchRect.x + PATCH_W/2, patchRect.y + PATCH_H/2);
+      ctx.font = '12px monospace';
+      ctx.fillText(`${patchRect.x}, ${patchRect.y}`, patchRect.x + PATCH_W/2, patchRect.y + PATCH_H/2 + 20);
+
+      // Draw gaze crosshair
+      const gazeX = (gazeNDC.x * 0.5 + 0.5) * FULL_W;
+      const gazeY = (-gazeNDC.y * 0.5 + 0.5) * FULL_H;
+
+      ctx.strokeStyle = '#ff0';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(gazeX - 20, gazeY);
+      ctx.lineTo(gazeX + 20, gazeY);
+      ctx.moveTo(gazeX, gazeY - 20);
+      ctx.lineTo(gazeX, gazeY + 20);
+      ctx.stroke();
+
+      // Check if markers are inside patch
+      markers.forEach(marker => {
+        const inside = (
+          marker.x >= patchRect.x &&
+          marker.x <= patchRect.x + PATCH_W &&
+          marker.y >= patchRect.y &&
+          marker.y <= patchRect.y + PATCH_H
+        );
+
+        // Check if gaze is near this marker
+        const distX = Math.abs(gazeX - marker.x);
+        const distY = Math.abs(gazeY - marker.y);
+        const isNear = distX < 150 && distY < 150;
+
+        if (isNear) {
+          // Highlight if correct/incorrect
+          ctx.strokeStyle = inside ? '#0f0' : '#f00';
+          ctx.lineWidth = 6;
+          ctx.beginPath();
+          ctx.arc(marker.x, marker.y, 45, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // Draw verdict
+          ctx.font = 'bold 20px monospace';
+          ctx.fillStyle = inside ? '#0f0' : '#f00';
+          const verdict = inside ? '✓ CORRECT' : '✗ WRONG';
+          const textY = marker.y < FULL_H/2 ? marker.y + 75 : marker.y - 75;
+          ctx.fillText(verdict, marker.x, textY);
+        }
+      });
+    }
+
+    function updateGaze() {
+      // Compute patch rect using CURRENT formula from main.ts
+      const cx = (gazeNDC.x * 0.5 + 0.5) * FULL_W;
+      const cy = (-gazeNDC.y * 0.5 + 0.5) * FULL_H;
+
+      const dx = Math.floor(clamp(cx - PATCH_W / 2, 0, FULL_W - PATCH_W));
+      const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
+
+      patchRect.x = dx;
+      patchRect.y = dy;
+
+      // Update info panel
+      document.getElementById('gaze_ndc').textContent = `(${gazeNDC.x.toFixed(2)}, ${gazeNDC.y.toFixed(2)})`;
+      document.getElementById('patch_center').textContent = `(${cx.toFixed(0)}, ${cy.toFixed(0)})`;
+      document.getElementById('patch_rect').textContent = `(${dx}, ${dy}) ${PATCH_W}×${PATCH_H}`;
+
+      // Check if any marker should be visible
+      let nearMarker = null;
+      const gazeX = cx;
+      const gazeY = cy;
+
+      markers.forEach(marker => {
+        const distX = Math.abs(gazeX - marker.x);
+        const distY = Math.abs(gazeY - marker.y);
+        if (distX < 150 && distY < 150) {
+          nearMarker = marker;
+        }
+      });
+
+      if (nearMarker) {
+        const inside = (
+          nearMarker.x >= dx &&
+          nearMarker.x <= dx + PATCH_W &&
+          nearMarker.y >= dy &&
+          nearMarker.y <= dy + PATCH_H
+        );
+        const statusEl = document.getElementById('status');
+        statusEl.textContent = inside ? `✓ ${nearMarker.name} OK` : `✗ ${nearMarker.name} WRONG`;
+        statusEl.className = inside ? 'value ok' : 'value error';
+      } else {
+        document.getElementById('status').textContent = 'Move to corner';
+        document.getElementById('status').className = 'value';
+      }
+
+      drawScene();
+    }
+
+    // Mouse tracking
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = (e.offsetX / canvas.width);
+      const y = (e.offsetY / canvas.height);
+
+      mouseNDC.x = x * 2 - 1;
+      mouseNDC.y = -(y * 2 - 1);
+
+      gazeNDC.x = mouseNDC.x;
+      gazeNDC.y = mouseNDC.y;
+
+      updateGaze();
+    });
+
+    // Try to read from main demo stats (if iframe/opener)
+    let readingFromDemo = false;
+    setInterval(() => {
+      try {
+        const stats = document.getElementById('senderStats') ||
+                     window.opener?.document?.getElementById('senderStats');
+
+        if (stats) {
+          const text = stats.textContent;
+          const matchGaze = text.match(/gazeNDC:\s+([\-\d.]+),\s+([\-\d.]+)/);
+          const matchUseEye = text.match(/use_eye:\s+(true|false)/);
+
+          if (matchGaze) {
+            gazeNDC.x = parseFloat(matchGaze[1]);
+            gazeNDC.y = parseFloat(matchGaze[2]);
+            const useEye = matchUseEye ? matchUseEye[1] === 'true' : false;
+
+            document.getElementById('mode').textContent = useEye ? 'EYE TRACKING ✓' : 'MOUSE';
+            document.getElementById('mode').className = useEye ? 'value ok' : 'value warning';
+
+            if (!readingFromDemo) {
+              readingFromDemo = true;
+              document.getElementById('instructions').innerHTML = `
+                <strong>📡 CONNECTED TO DEMO!</strong>
+                <p style="color: #0f0;">Reading live gaze data from main demo</p>
+                <p><strong style="color: #0ff;">Muovi occhi/mouse verso i marker colorati</strong></p>
+                <p><strong style="color: #ff0;">Il marker DEVE essere dentro il rettangolo BLU!</strong></p>
+              `;
+            }
+
+            updateGaze();
+          }
+        }
+      } catch (e) {
+        // Can't access - continue with mouse mode
+      }
+    }, 100);
+
+    // Initial draw
+    drawScene();
+
+    // Instructions
+    setTimeout(() => {
+      if (!readingFromDemo) {
+        document.getElementById('instructions').innerHTML += `
+          <p style="color: #888; font-size: 11px; margin-top: 10px;">
+            💡 Tip: Apri la demo principale (http://localhost:5175) nello stesso tab e poi torna qui per vedere i dati live
+          </p>
+        `;
+      }
+    }, 2000);
+  </script>
+</body>
+</html>

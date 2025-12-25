@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Quick Reset - FoveaRender</title>
+  <style>
+    body {
+      margin: 0;
+      background: #0a0a0a;
+      color: #0ff;
+      font-family: 'Courier New', monospace;
+      padding: 40px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+    }
+    h1 { color: #ff0; }
+    .btn-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 15px;
+      justify-content: center;
+      max-width: 800px;
+    }
+    button {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
+      border: none;
+      padding: 20px 30px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      border-radius: 10px;
+      transition: transform 0.2s, box-shadow 0.2s;
+      min-width: 200px;
+    }
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+    }
+    button:active {
+      transform: translateY(0);
+    }
+    .danger {
+      background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+    }
+    .success {
+      background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+    }
+    .warning {
+      background: linear-gradient(135deg, #fad961 0%, #f76b1c 100%);
+    }
+    #result {
+      margin-top: 20px;
+      padding: 20px;
+      background: rgba(0,255,255,0.1);
+      border: 1px solid #0ff;
+      border-radius: 10px;
+      min-height: 100px;
+      width: 100%;
+      max-width: 600px;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .code {
+      background: #1a1a1a;
+      padding: 10px;
+      border-radius: 5px;
+      border: 1px solid #333;
+      margin: 10px 0;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+    }
+    .bookmarklet {
+      background: #2a2a2a;
+      padding: 15px;
+      border: 2px dashed #0ff;
+      border-radius: 5px;
+      margin: 20px 0;
+      max-width: 600px;
+    }
+    a.bookmark {
+      display: inline-block;
+      background: #0ff;
+      color: #000;
+      padding: 10px 20px;
+      text-decoration: none;
+      border-radius: 5px;
+      font-weight: bold;
+      margin: 10px 0;
+    }
+    a.bookmark:hover {
+      background: #00ffff;
+      box-shadow: 0 0 10px #0ff;
+    }
+  </style>
+</head>
+<body>
+  <h1>⚡ FoveaRender Quick Reset</h1>
+
+  <div class="btn-container">
+    <button class="warning" onclick="resetCalibration()">
+      🗑️ Reset Calibrazione
+    </button>
+
+    <button class="success" onclick="checkStatus()">
+      🔍 Check Status
+    </button>
+
+    <button onclick="startMonitor()">
+      📊 Start Gaze Monitor
+    </button>
+
+    <button onclick="stopMonitor()">
+      🛑 Stop Monitor
+    </button>
+
+    <button onclick="testCoordinates()">
+      🎯 Test Coordinate
+    </button>
+
+    <button class="danger" onclick="hardReset()">
+      🚨 HARD RESET
+    </button>
+
+    <button class="success" onclick="location.href='/'">
+      ← Back to Demo
+    </button>
+  </div>
+
+  <div id="result">
+    <strong>Pronto!</strong> Clicca sui pulsanti sopra per eseguire azioni rapide.
+  </div>
+
+  <div class="bookmarklet">
+    <strong>📌 Bookmarklet (Trascina nella barra preferiti):</strong><br><br>
+    <a class="bookmark" href="javascript:(function(){localStorage.removeItem('fovea.calib.v1');alert('Calibrazione cancellata!');location.reload();})()">
+      🗑️ Reset Calib
+    </a>
+    <br><br>
+    <small style="color: #888;">Trascina questo link nei preferiti del browser per reset veloce da qualsiasi pagina FoveaRender</small>
+  </div>
+
+  <div class="code">
+    <strong>Console Commands:</strong><br>
+    Apri con F12 e copia/incolla:<br><br>
+    <code>localStorage.removeItem('fovea.calib.v1'); location.reload();</code>
+  </div>
+
+  <script>
+    let monitorInterval = null;
+    let coordListener = null;
+
+    function log(msg, type = 'info') {
+      const result = document.getElementById('result');
+      const colors = {
+        info: '#0ff',
+        success: '#0f0',
+        error: '#f00',
+        warning: '#ff0'
+      };
+      const timestamp = new Date().toLocaleTimeString();
+      result.innerHTML = `<div style="color: ${colors[type]}">[${timestamp}] ${msg}</div>` + result.innerHTML;
+    }
+
+    function resetCalibration() {
+      try {
+        localStorage.removeItem('fovea.calib.v1');
+        log('✅ Calibrazione cancellata! Ricarico la pagina...', 'success');
+        setTimeout(() => location.reload(), 1000);
+      } catch (e) {
+        log('❌ Errore: ' + e.message, 'error');
+      }
+    }
+
+    function checkStatus() {
+      log('🔍 Checking system status...', 'info');
+
+      const calib = localStorage.getItem('fovea.calib.v1');
+      log(calib ? '📋 Calibration: ✓ Found' : '📋 Calibration: ✗ Not found', calib ? 'success' : 'warning');
+
+      const canvas = document.createElement('canvas');
+      const gl = canvas.getContext('webgl2');
+      log(gl ? '🎨 WebGL2: ✓ Supported' : '🎨 WebGL2: ✗ Not supported', gl ? 'success' : 'error');
+
+      log(window.RTCPeerConnection ? '📡 WebRTC: ✓ Supported' : '📡 WebRTC: ✗ Not supported',
+          window.RTCPeerConnection ? 'success' : 'error');
+
+      log((navigator.mediaDevices && navigator.mediaDevices.getUserMedia) ?
+          '📷 MediaDevices: ✓ Supported' : '📷 MediaDevices: ✗ Not supported',
+          (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) ? 'success' : 'error');
+
+      log('✅ Status check complete!', 'success');
+    }
+
+    function startMonitor() {
+      if (monitorInterval) {
+        log('⚠️ Monitor already running!', 'warning');
+        return;
+      }
+
+      log('📊 Starting gaze monitor...', 'info');
+
+      monitorInterval = setInterval(() => {
+        // Try to get stats from main demo (if iframe or same origin)
+        try {
+          const stats = document.getElementById('senderStats') ||
+                       window.opener?.document?.getElementById('senderStats');
+
+          if (stats) {
+            const text = stats.textContent;
+            const matchGaze = text.match(/gazeNDC:\s+([\-\d.]+),\s+([\-\d.]+)/);
+            const matchUseEye = text.match(/use_eye:\s+(true|false)/);
+            const matchConf = text.match(/conf:\s+([\d.]+)/);
+
+            if (matchGaze) {
+              const x = parseFloat(matchGaze[1]);
+              const y = parseFloat(matchGaze[2]);
+              const useEye = matchUseEye ? matchUseEye[1] === 'true' : false;
+              const conf = matchConf ? parseFloat(matchConf[1]) : 0;
+
+              const dir = `${x > 0.1 ? 'RIGHT' : x < -0.1 ? 'LEFT' : 'CTR'} / ${y > 0.1 ? 'UP' : y < -0.1 ? 'DOWN' : 'CTR'}`;
+
+              log(`👁️ Gaze (${useEye ? 'EYE' : 'MOUSE'}): X=${x.toFixed(2)} Y=${y.toFixed(2)} ${dir} (conf=${conf.toFixed(2)})`, 'info');
+            }
+          } else {
+            log('⚠️ Cannot access stats (open demo in same window)', 'warning');
+          }
+        } catch (e) {
+          log('⚠️ Monitor error: ' + e.message, 'error');
+        }
+      }, 1000);
+
+      log('✅ Monitor started! (updates every second)', 'success');
+    }
+
+    function stopMonitor() {
+      if (!monitorInterval) {
+        log('⚠️ Monitor not running!', 'warning');
+        return;
+      }
+
+      clearInterval(monitorInterval);
+      monitorInterval = null;
+      log('✅ Monitor stopped!', 'success');
+    }
+
+    function testCoordinates() {
+      if (coordListener) {
+        document.removeEventListener('mousemove', coordListener);
+        coordListener = null;
+        log('✅ Coordinate test stopped!', 'success');
+        return;
+      }
+
+      log('🎯 Move mouse to see coordinates...', 'info');
+
+      let lastX = 0, lastY = 0;
+      coordListener = (e) => {
+        const x = (e.clientX / window.innerWidth) * 2 - 1;
+        const y = -((e.clientY / window.innerHeight) * 2 - 1);
+
+        if (Math.abs(x - lastX) > 0.1 || Math.abs(y - lastY) > 0.1) {
+          lastX = x;
+          lastY = y;
+          const dirX = x > 0.1 ? 'RIGHT' : x < -0.1 ? 'LEFT' : 'CENTER';
+          const dirY = y > 0.1 ? 'UP' : y < -0.1 ? 'DOWN' : 'CENTER';
+          log(`🖱️ Mouse: X=${x.toFixed(2)} Y=${y.toFixed(2)} (${dirX} / ${dirY})`, 'info');
+        }
+      };
+
+      document.addEventListener('mousemove', coordListener);
+      log('✅ Coordinate test active! Click "Test Coordinate" again to stop.', 'success');
+    }
+
+    function hardReset() {
+      if (!confirm('⚠️ This will clear ALL storage and reload. Continue?')) {
+        return;
+      }
+
+      log('🚨 Performing HARD RESET...', 'warning');
+      localStorage.clear();
+      sessionStorage.clear();
+      log('✅ Storage cleared! Reloading...', 'success');
+      setTimeout(() => location.reload(true), 1000);
+    }
+
+    // Auto-check on load
+    window.addEventListener('load', () => {
+      setTimeout(checkStatus, 500);
+    });
+  </script>
+</body>
+</html>

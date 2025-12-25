@@ -50,3 +50,6 @@ export function makeSchrodingerScene(renderer: THREE.WebGLRenderer) {
   return { scene, camera, update, gazeNDC };
 }
 
+
+
+
