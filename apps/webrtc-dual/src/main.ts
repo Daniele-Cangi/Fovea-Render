@@ -112,7 +112,8 @@ const TEL = {
   utilPatch: null as number | null,
   hungryPatch: null as boolean | null,
   useEye: null as boolean | null,
-  gazeConf: null as number | null
+  gazeConf: null as number | null,
+  gazeMode: null as GazeFilterMode | null
 };
 
 function telNowMs() { return performance.now(); }
@@ -167,13 +168,77 @@ type CalibrationStats = {
   leftRmse: number | null;
   rightRmse: number | null;
   points: number;
+  tier?: "strict" | "provisional";
 };
 
 type CalibrationRunResult = {
   ok: boolean;
   aborted: boolean;
+  qualityRejected: boolean;
   stats: CalibrationStats | null;
+  appliedStats: CalibrationStats | null;
 };
+
+type GazeFilterMode = "fallback" | "fixation" | "saccade";
+
+const CALIB_STORAGE_KEY = "fovea.calib.v2";
+const CALIB_STATS_STORAGE_KEY = "fovea.calib.stats.v1";
+const CALIB_RMSE_ACCEPT_MAX = 0.33;
+const CALIB_RMSE_PROVISIONAL_MAX = 0.52;
+const CALIB_AUTO_MAX_ATTEMPTS = 3;
+const CALIB_STRICT_REFINEMENT_ATTEMPTS = 1;
+const CALIB_SIDE_RATIO_MAX = 1.55;
+const CALIB_SIDE_RMSE_MAX = 0.42;
+const CALIB_SIDE_RATIO_PROVISIONAL_MAX = 1.85;
+const CALIB_SIDE_RMSE_PROVISIONAL_MAX = 0.58;
+const CALIB_MAXERR_PROVISIONAL_MAX = 1.10;
+
+function isFiniteNum(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function normalizeCalibrationStats(raw: unknown): CalibrationStats | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const rmse = r.rmse;
+  const maxErr = r.maxErr;
+  const points = r.points;
+  if (!isFiniteNum(rmse) || !isFiniteNum(maxErr) || !isFiniteNum(points)) return null;
+  const leftRmse = isFiniteNum(r.leftRmse) ? r.leftRmse : null;
+  const rightRmse = isFiniteNum(r.rightRmse) ? r.rightRmse : null;
+  const tierRaw = r.tier;
+  const tier = tierRaw === "strict" || tierRaw === "provisional" ? tierRaw : undefined;
+  return {
+    rmse,
+    maxErr,
+    leftRmse,
+    rightRmse,
+    points: Math.max(0, Math.round(points)),
+    tier
+  };
+}
+
+function loadCalibrationStatsFromStorage(): CalibrationStats | null {
+  try {
+    const raw = localStorage.getItem(CALIB_STATS_STORAGE_KEY);
+    if (!raw) return null;
+    return normalizeCalibrationStats(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+function saveCalibrationStatsToStorage(stats: CalibrationStats | null) {
+  try {
+    if (!stats) {
+      localStorage.removeItem(CALIB_STATS_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(CALIB_STATS_STORAGE_KEY, JSON.stringify(stats));
+  } catch {
+    // Ignore storage failures.
+  }
+}
 
 type ReadingAnalysisSample = {
   t_ms: number;
@@ -187,6 +252,9 @@ type ReadingAnalysisSample = {
   ctrl_y: number;
   filt_x: number;
   filt_y: number;
+  est_x: number;
+  est_y: number;
+  filter_mode: GazeFilterMode;
   patch_cx: number;
   patch_cy: number;
 };
@@ -203,6 +271,7 @@ const ANALYSIS = {
   statusEl: null as HTMLDivElement | null,
   samples: [] as ReadingAnalysisSample[],
   calibration: null as CalibrationStats | null,
+  calibrationAttempted: null as CalibrationStats | null,
   lastSummary: null as Record<string, unknown> | null
 };
 
@@ -343,7 +412,10 @@ window.addEventListener("keydown", (e) => {
   }
   if (k === "r") {
     if (ANALYSIS.running) stopReadingAnalysis("manual");
-    else startReadingAnalysis({ durationMs: 22000, auto: false, calibration: null });
+    else {
+      const c = loadCalibrationStatsFromStorage();
+      startReadingAnalysis({ durationMs: 22000, auto: false, calibration: c, calibrationAttempted: c });
+    }
   }
   if (k === "a") void runCalibrationThenReadingAnalysis();
   if (k === "t") TEL.enabled = !TEL.enabled; // toggle
@@ -1105,6 +1177,12 @@ cOut.style.width = "640px"; cOut.style.height = "360px"; // Smaller receiver
 
 // ---------- GAZE (eye tracking + mouse fallback) ----------
 const gazeNDC = new THREE.Vector2(0, 0);
+const gazeEstNDC = new THREE.Vector2(0, 0);
+const gazeVelNDC = new THREE.Vector2(0, 0);
+let gazeEstInit = false;
+let gazeEstLastMs = 0;
+let gazeFilterMode: GazeFilterMode = "fallback";
+let gazeFilterModeSinceMs = 0;
 const mouseNDC = new THREE.Vector2(0, 0);
 let LOD_ON = true;
 
@@ -1118,24 +1196,46 @@ const EYE_HOLD_MS = 900;
 const MOUSE_FOLLOW_FAST = 0.55;
 const MOUSE_FOLLOW_SLOW = 0.10;
 
-// Additional smoothing dedicated to patch positioning/zoom window.
+// Adaptive gaze estimator (measurement -> estimate) before patch controller.
+const EST_DEADZONE_X = 0.018;
+const EST_DEADZONE_Y = 0.016;
+const EST_POS_GAIN_FIX = 0.19;
+const EST_POS_GAIN_SAC = 0.56;
+const EST_VEL_GAIN_FIX = 0.060;
+const EST_VEL_GAIN_SAC = 0.16;
+const EST_MAX_STEP_FIX_X = 0.022;
+const EST_MAX_STEP_FIX_Y = 0.020;
+const EST_MAX_STEP_SAC_X = 0.120;
+const EST_MAX_STEP_SAC_Y = 0.100;
+const EST_MAX_VEL_X = 2.8;
+const EST_MAX_VEL_Y = 2.4;
+const EST_VEL_DAMP_FIX = 0.76;
+const EST_VEL_DAMP_SAC = 0.84;
+const EST_SACCADE_ENTER_SPEED = 1.85;
+const EST_SACCADE_EXIT_SPEED = 0.75;
+const EST_MODE_HOLD_MS = 62;
+const EST_RIGHT_DAMP = 0.90;
+
+// Additional control smoothing dedicated to patch positioning/zoom window.
 const gazeFocusNDC = new THREE.Vector2(0, 0);
 let gazeFocusInit = false;
-const FOCUS_DEADZONE = 0.018;
-const FOCUS_DEADZONE_X = 0.022;
-const FOCUS_DEADZONE_Y = 0.018;
-const FOCUS_SLOW = 0.17;
-const FOCUS_FAST = 0.30;
-const FOCUS_SUPER_FAST = 0.48;
-const FOCUS_MED_DIST = 0.12;
-const FOCUS_BIG_DIST = 0.30;
-const FOCUS_MAX_STEP = 0.035;
-const FOCUS_MAX_STEP_X = 0.028;
-const FOCUS_MAX_STEP_Y = 0.030;
-const FOCUS_MOUSE_FOLLOW = 0.45;
+const FOCUS_DEADZONE = 0.015;
+const FOCUS_DEADZONE_X = 0.017;
+const FOCUS_DEADZONE_Y = 0.015;
+const FOCUS_SLOW = 0.20;
+const FOCUS_FAST = 0.33;
+const FOCUS_SUPER_FAST = 0.56;
+const FOCUS_MED_DIST = 0.10;
+const FOCUS_BIG_DIST = 0.24;
+const FOCUS_MAX_STEP = 0.040;
+const FOCUS_MAX_STEP_X = 0.033;
+const FOCUS_MAX_STEP_Y = 0.035;
+const FOCUS_MOUSE_FOLLOW = 0.42;
+const PATCH_SENSITIVITY_X = 0.88;
+const PATCH_SENSITIVITY_Y = 0.80;
 const PATCH_EDGE_SNAP_PX = 3;
 const PATCH_DEADBAND_X_PX = 2;
-const PATCH_DEADBAND_Y_PX = 0;
+const PATCH_DEADBAND_Y_PX = 1;
 const PATCH_QUANT_X_PX = 2;
 const PATCH_QUANT_Y_PX = 1;
 const PATCH_EDGE_LOCK_X_PX = 6;
@@ -1146,7 +1246,85 @@ let patchRectAppliedInit = false;
 let patchRectAppliedX = 0;
 let patchRectAppliedY = 0;
 
-function updatePatchFocus(target: THREE.Vector2, useEye: boolean) {
+function setGazeFilterMode(next: GazeFilterMode, tMs: number) {
+  if (gazeFilterMode === next) return;
+  gazeFilterMode = next;
+  gazeFilterModeSinceMs = tMs;
+}
+
+function updateGazeEstimate(target: THREE.Vector2, useEye: boolean, conf = 0, tMs = performance.now()) {
+  if (!gazeEstInit) {
+    gazeEstInit = true;
+    gazeEstLastMs = tMs;
+    gazeEstNDC.copy(target);
+    gazeVelNDC.set(0, 0);
+    gazeFilterMode = useEye ? "fixation" : "fallback";
+    gazeFilterModeSinceMs = tMs;
+    return;
+  }
+
+  const dt = clamp((tMs - gazeEstLastMs) / 1000, 1 / 240, 0.080);
+  gazeEstLastMs = tMs;
+
+  if (!useEye) {
+    setGazeFilterMode("fallback", tMs);
+    gazeEstNDC.lerp(target, FOCUS_MOUSE_FOLLOW);
+    gazeVelNDC.multiplyScalar(0.70);
+    return;
+  }
+
+  const predX = gazeEstNDC.x + gazeVelNDC.x * dt;
+  const predY = gazeEstNDC.y + gazeVelNDC.y * dt;
+  let errX = target.x - predX;
+  let errY = target.y - predY;
+
+  const innovationSpeed = Math.hypot(errX, errY) / Math.max(dt, 1e-4);
+  const modeAgeMs = tMs - gazeFilterModeSinceMs;
+
+  if (gazeFilterMode !== "saccade" && innovationSpeed >= EST_SACCADE_ENTER_SPEED && modeAgeMs >= EST_MODE_HOLD_MS) {
+    setGazeFilterMode("saccade", tMs);
+  } else if (gazeFilterMode === "saccade" && innovationSpeed <= EST_SACCADE_EXIT_SPEED && modeAgeMs >= EST_MODE_HOLD_MS) {
+    setGazeFilterMode("fixation", tMs);
+  } else if (gazeFilterMode === "fallback") {
+    setGazeFilterMode("fixation", tMs);
+  }
+
+  const isSaccade = gazeFilterMode === "saccade";
+  const confBoost = clamp((conf - 0.35) / 0.55, 0, 1);
+
+  if (!isSaccade) {
+    const dzX = lerp(EST_DEADZONE_X, EST_DEADZONE_X * 0.6, confBoost);
+    const dzY = lerp(EST_DEADZONE_Y, EST_DEADZONE_Y * 0.6, confBoost);
+    if (Math.abs(errX) < dzX) errX = 0;
+    if (Math.abs(errY) < dzY) errY = 0;
+  }
+
+  const rightDamp = (target.x > 0 || predX > 0) ? EST_RIGHT_DAMP : 1.0;
+  const posGain = isSaccade ? EST_POS_GAIN_SAC : EST_POS_GAIN_FIX;
+  const velGain = isSaccade ? EST_VEL_GAIN_SAC : EST_VEL_GAIN_FIX;
+  const gainBoost = lerp(0.95, 1.20, confBoost);
+
+  const maxStepX = (isSaccade ? EST_MAX_STEP_SAC_X : EST_MAX_STEP_FIX_X) * rightDamp;
+  const maxStepY = isSaccade ? EST_MAX_STEP_SAC_Y : EST_MAX_STEP_FIX_Y;
+
+  const stepX = clamp(errX * posGain * gainBoost, -maxStepX, maxStepX);
+  const stepY = clamp(errY * posGain * gainBoost, -maxStepY, maxStepY);
+
+  gazeEstNDC.set(
+    clamp(predX + stepX, -1, 1),
+    clamp(predY + stepY, -1, 1)
+  );
+
+  const velTargetX = clamp((stepX / dt) * velGain, -EST_MAX_VEL_X, EST_MAX_VEL_X);
+  const velTargetY = clamp((stepY / dt) * velGain, -EST_MAX_VEL_Y, EST_MAX_VEL_Y);
+  const velDamp = isSaccade ? EST_VEL_DAMP_SAC : EST_VEL_DAMP_FIX;
+  gazeVelNDC.set(
+    clamp(gazeVelNDC.x * velDamp + velTargetX, -EST_MAX_VEL_X, EST_MAX_VEL_X),
+    clamp(gazeVelNDC.y * velDamp + velTargetY, -EST_MAX_VEL_Y, EST_MAX_VEL_Y)
+  );
+}
+
+function updatePatchFocus(target: THREE.Vector2, useEye: boolean, conf = 0, mode: GazeFilterMode = "fallback") {
   if (!gazeFocusInit) {
     gazeFocusInit = true;
     gazeFocusNDC.copy(target);
@@ -1159,10 +1337,16 @@ function updatePatchFocus(target: THREE.Vector2, useEye: boolean) {
     return;
   }
 
-  const dx = target.x - gazeFocusNDC.x;
-  const dy = target.y - gazeFocusNDC.y;
-  const effDx = Math.abs(dx) < FOCUS_DEADZONE_X ? 0 : dx;
-  const effDy = Math.abs(dy) < FOCUS_DEADZONE_Y ? 0 : dy;
+  const leadSec = mode === "saccade" ? 0.060 : 0.034;
+  const tx = clamp(target.x + gazeVelNDC.x * leadSec, -1, 1);
+  const ty = clamp(target.y + gazeVelNDC.y * leadSec, -1, 1);
+  const dx = tx - gazeFocusNDC.x;
+  const dy = ty - gazeFocusNDC.y;
+  const confBoost = clamp((conf - 0.45) / 0.45, 0, 1);
+  const dzX = lerp(FOCUS_DEADZONE_X, FOCUS_DEADZONE_X * 0.65, confBoost);
+  const dzY = lerp(FOCUS_DEADZONE_Y, FOCUS_DEADZONE_Y * 0.65, confBoost);
+  const effDx = Math.abs(dx) < dzX ? 0 : dx;
+  const effDy = Math.abs(dy) < dzY ? 0 : dy;
   if (effDx === 0 && effDy === 0) return;
 
   const dist = Math.sqrt(effDx * effDx + effDy * effDy);
@@ -1171,9 +1355,15 @@ function updatePatchFocus(target: THREE.Vector2, useEye: boolean) {
   let follow = FOCUS_SLOW;
   if (dist > FOCUS_BIG_DIST) follow = FOCUS_SUPER_FAST;
   else if (dist > FOCUS_MED_DIST) follow = FOCUS_FAST;
-  const maxStep = dist > 0.35 ? (FOCUS_MAX_STEP * 1.35) : FOCUS_MAX_STEP;
-  const maxStepX = Math.min(maxStep, FOCUS_MAX_STEP_X);
-  const maxStepY = Math.min(maxStep, FOCUS_MAX_STEP_Y);
+  if (mode === "fixation") follow *= 0.96;
+  else if (mode === "saccade") follow *= 1.30;
+  follow *= lerp(1.0, 1.25, confBoost);
+
+  const modeStepScale = mode === "saccade" ? 1.32 : (mode === "fixation" ? 0.98 : 1.0);
+  const maxStep = dist > 0.35 ? (FOCUS_MAX_STEP * 1.35 * modeStepScale) : (FOCUS_MAX_STEP * modeStepScale);
+  const maxStepGain = lerp(1.0, 1.22, confBoost);
+  const maxStepX = Math.min(maxStep * maxStepGain, FOCUS_MAX_STEP_X * 1.25);
+  const maxStepY = Math.min(maxStep * maxStepGain, FOCUS_MAX_STEP_Y * 1.25);
   const stepX = clamp(effDx * follow, -maxStepX, maxStepX);
   const stepY = clamp(effDy * follow, -maxStepY, maxStepY);
 
@@ -1368,11 +1558,24 @@ function countEyeDropouts(samples: ReadingAnalysisSample[]) {
   return cnt;
 }
 
+function gazeToPatchCenterNorm(gazeX: number, gazeY: number) {
+  const gx = clamp(gazeX * PATCH_SENSITIVITY_X, -1, 1);
+  const gy = clamp(gazeY * PATCH_SENSITIVITY_Y, -1, 1);
+  const minCx = (PATCH_W * 0.5) / FULL_W;
+  const maxCx = 1 - minCx;
+  const minCy = (PATCH_H * 0.5) / FULL_H;
+  const maxCy = 1 - minCy;
+  const cx = clamp(gx * 0.5 + 0.5, minCx, maxCx);
+  const cy = clamp((-gy) * 0.5 + 0.5, minCy, maxCy);
+  return { cx, cy };
+}
+
 function buildReadingAnalysisSummary(
   reason: ReadingAnalysisStopReason,
   samples: ReadingAnalysisSample[],
   durationMs: number,
-  calibration: CalibrationStats | null
+  calibration: CalibrationStats | null,
+  calibrationAttempted: CalibrationStats | null
 ) {
   const confVals = samples.map((s) => s.conf);
   const eyeSamples = samples.filter((s) => s.use_eye);
@@ -1383,18 +1586,27 @@ function buildReadingAnalysisSummary(
   const jitterRight = rmsStep(samples, (_p, c) => c.filt_x >= 0);
   const rightLeftRatio = jitterLeft > 1e-6 ? (jitterRight / jitterLeft) : null;
   const ctrlVsFilt = mean(samples.map((s) => Math.hypot(s.ctrl_x - s.filt_x, s.ctrl_y - s.filt_y)));
-  const patchTrackErr = mean(samples.map((s) => {
+  const estVsFilt = mean(samples.map((s) => Math.hypot(s.est_x - s.filt_x, s.est_y - s.filt_y)));
+  const patchTrackErrRaw = mean(samples.map((s) => {
     const nx = (s.filt_x + 1) * 0.5;
     const ny = (-s.filt_y + 1) * 0.5;
     return Math.hypot(nx - s.patch_cx, ny - s.patch_cy);
+  }));
+  const patchTrackErr = mean(samples.map((s) => {
+    const expected = gazeToPatchCenterNorm(s.filt_x, s.filt_y);
+    return Math.hypot(expected.cx - s.patch_cx, expected.cy - s.patch_cy);
   }));
   const dropouts = countEyeDropouts(samples);
 
   const notes: string[] = [];
   if (eyeUsageRatio < 0.70) notes.push("Eye lock debole: troppi fallback o perdita confidenza.");
   if (rightLeftRatio != null && rightLeftRatio > 1.20) notes.push("Instabilita maggiore a destra rispetto a sinistra.");
-  if (patchTrackErr > 0.080) notes.push("Lag/mismatch visibile tra gaze filtrato e centro patch.");
+  if (estVsFilt > 0.038) notes.push("Filtro troppo conservativo: si percepisce ritardo durante i movimenti.");
+  if (patchTrackErr > 0.040) notes.push("Lag/mismatch visibile tra gaze filtrato e centro patch.");
   if (percentile(confVals, 0.10) < 0.25) notes.push("Confidenza spesso bassa: migliorare luce e posizione camera.");
+  if (!calibration) notes.push("Calibrazione attiva non disponibile nel report: run considerato diagnostico.");
+  if (calibration?.tier === "provisional") notes.push("Calibrazione provvisoria in uso: ripetere calibrazione per una baseline piu robusta.");
+  if (calibration && calibration.rmse > CALIB_RMSE_ACCEPT_MAX) notes.push("Calibrazione in uso debole: ripetere calibrazione prima del tuning fine.");
   if (notes.length === 0) notes.push("Sessione abbastanza stabile; resta da rifinire tuning fine.");
 
   return {
@@ -1404,6 +1616,7 @@ function buildReadingAnalysisSummary(
     duration_ms: Math.round(durationMs),
     samples: samples.length,
     calibration,
+    calibration_attempted: calibrationAttempted,
     metrics: {
       eye_usage_ratio: +eyeUsageRatio.toFixed(4),
       conf_mean: +mean(confVals).toFixed(4),
@@ -1415,7 +1628,9 @@ function buildReadingAnalysisSummary(
       jitter_rms_step_right: +jitterRight.toFixed(6),
       jitter_right_left_ratio: rightLeftRatio == null ? null : +rightLeftRatio.toFixed(4),
       ctrl_vs_filt_mean_dist: +ctrlVsFilt.toFixed(6),
+      est_vs_filt_mean_dist: +estVsFilt.toFixed(6),
       patch_track_error_mean: +patchTrackErr.toFixed(6),
+      patch_track_error_raw_mean: +patchTrackErrRaw.toFixed(6),
       eye_dropouts: dropouts
     },
     notes
@@ -1426,6 +1641,7 @@ function startReadingAnalysis(opts: {
   durationMs?: number;
   auto: boolean;
   calibration: CalibrationStats | null;
+  calibrationAttempted?: CalibrationStats | null;
 }) {
   if (ANALYSIS.running) return false;
   const durationMs = opts.durationMs ?? 22000;
@@ -1435,6 +1651,7 @@ function startReadingAnalysis(opts: {
   ANALYSIS.stopAtMs = ANALYSIS.startedAtMs + durationMs;
   ANALYSIS.samples.length = 0;
   ANALYSIS.calibration = opts.calibration;
+  ANALYSIS.calibrationAttempted = opts.calibrationAttempted ?? opts.calibration;
   patchMode = 4;
   setAnalysisStatus(
     `Analisi ${opts.auto ? "AUTO" : "MANUALE"} in corso: leggi il testo nel riquadro (${Math.ceil(durationMs / 1000)}s).`,
@@ -1449,7 +1666,13 @@ function stopReadingAnalysis(reason: ReadingAnalysisStopReason) {
   ANALYSIS.running = false;
   const endedAtMs = performance.now();
   const durationMs = Math.max(0, endedAtMs - ANALYSIS.startedAtMs);
-  const summary = buildReadingAnalysisSummary(reason, ANALYSIS.samples, durationMs, ANALYSIS.calibration);
+  const summary = buildReadingAnalysisSummary(
+    reason,
+    ANALYSIS.samples,
+    durationMs,
+    ANALYSIS.calibration,
+    ANALYSIS.calibrationAttempted
+  );
   ANALYSIS.lastSummary = summary as Record<string, unknown>;
 
   const stamp = makeStamp();
@@ -1483,7 +1706,9 @@ function captureReadingAnalysisSample(
   gf: ReturnType<MediapipeGazeProvider["getFrame"]>,
   useEye: boolean,
   gazeCtrl: THREE.Vector2,
-  gazeFilt: THREE.Vector2
+  gazeFilt: THREE.Vector2,
+  gazeEst: THREE.Vector2,
+  filterMode: GazeFilterMode
 ) {
   if (!ANALYSIS.running) return;
   const patchCx = patchRectN.x + patchRectN.z * 0.5;
@@ -1500,16 +1725,20 @@ function captureReadingAnalysisSample(
     ctrl_y: +gazeCtrl.y.toFixed(6),
     filt_x: +gazeFilt.x.toFixed(6),
     filt_y: +gazeFilt.y.toFixed(6),
+    est_x: +gazeEst.x.toFixed(6),
+    est_y: +gazeEst.y.toFixed(6),
+    filter_mode: filterMode,
     patch_cx: +patchCx.toFixed(6),
     patch_cy: +patchCy.toFixed(6)
   });
 
-  const remainMs = Math.max(0, ANALYSIS.stopAtMs - tMs);
+  const nowMs = performance.now();
+  const remainMs = Math.max(0, ANALYSIS.stopAtMs - nowMs);
   setAnalysisStatus(
     `Analisi ${ANALYSIS.auto ? "AUTO" : "MANUALE"}: ${Math.ceil(remainMs / 1000)}s | conf ${gf.conf.toFixed(2)} | samples ${ANALYSIS.samples.length}`,
     true
   );
-  if (tMs >= ANALYSIS.stopAtMs) stopReadingAnalysis("timeout");
+  if (nowMs >= ANALYSIS.stopAtMs || tMs >= ANALYSIS.stopAtMs) stopReadingAnalysis("timeout");
 }
 
 async function runCalibrationThenReadingAnalysis() {
@@ -1517,18 +1746,98 @@ async function runCalibrationThenReadingAnalysis() {
   ANALYSIS.autoPipeline = true;
   setAnalysisStatus("Routine auto: calibrazione in corso...", true);
   try {
-    const cal = await calibrate3x3();
-    if (!cal.ok) {
-      setAnalysisStatus(
-        cal.aborted
-          ? "Routine auto annullata: calibrazione interrotta."
-          : "Routine auto annullata: calibrazione non valida.",
-        true
-      );
+    let cal: CalibrationRunResult | null = null;
+    for (let attempt = 1; attempt <= CALIB_AUTO_MAX_ATTEMPTS; attempt++) {
+      setAnalysisStatus(`Routine auto: calibrazione in corso (${attempt}/${CALIB_AUTO_MAX_ATTEMPTS})...`, true);
+      cal = await calibrate3x3();
+      if (cal.ok || cal.aborted) break;
+      if (cal.qualityRejected && attempt < CALIB_AUTO_MAX_ATTEMPTS) {
+        const rmseTxt = cal.stats ? cal.stats.rmse.toFixed(3) : "n/a";
+        setAnalysisStatus(
+          `Calibrazione scartata (RMSE ${rmseTxt} > ${CALIB_RMSE_ACCEPT_MAX.toFixed(2)}), nuovo tentativo...`,
+          true
+        );
+        await new Promise((r) => setTimeout(r, 420));
+        continue;
+      }
+      break;
+    }
+
+    if (!cal || cal.aborted) {
+      setAnalysisStatus("Routine auto annullata: calibrazione interrotta.", true);
       hideAnalysisStatus(2400);
       return;
     }
-    startReadingAnalysis({ durationMs: 22000, auto: true, calibration: cal.stats });
+
+    let finalCal = cal;
+    if (cal.ok && cal.appliedStats?.tier === "provisional") {
+      for (let refine = 1; refine <= CALIB_STRICT_REFINEMENT_ATTEMPTS; refine++) {
+        const pRmse = cal.appliedStats.rmse.toFixed(3);
+        setAnalysisStatus(
+          `Calibrazione provvisoria (RMSE ${pRmse}); tentativo affinamento strict (${refine}/${CALIB_STRICT_REFINEMENT_ATTEMPTS})...`,
+          true
+        );
+        const refined = await calibrate3x3();
+        if (refined.aborted) {
+          setAnalysisStatus("Routine auto annullata: affinamento calibrazione interrotto.", true);
+          hideAnalysisStatus(2400);
+          return;
+        }
+        if (refined.ok && refined.appliedStats?.tier === "strict") {
+          finalCal = refined;
+          setAnalysisStatus(
+            `Calibrazione strict ottenuta (RMSE ${refined.appliedStats.rmse.toFixed(3)}), avvio analisi...`,
+            true
+          );
+          await new Promise((r) => setTimeout(r, 320));
+          break;
+        }
+        const activeTxt = refined.appliedStats ? refined.appliedStats.rmse.toFixed(3) : "n/a";
+        setAnalysisStatus(
+          `Affinamento non strict (calibrazione attiva RMSE ${activeTxt}), continuo con provvisoria...`,
+          true
+        );
+        await new Promise((r) => setTimeout(r, 320));
+      }
+    }
+
+    if (!finalCal.ok && finalCal.qualityRejected) {
+      // Continue analysis with previous calibration so reports are always generated.
+      const rmseTxt = finalCal.stats ? finalCal.stats.rmse.toFixed(3) : "n/a";
+      const activeTxt = finalCal.appliedStats ? finalCal.appliedStats.rmse.toFixed(3) : "n/a";
+      setAnalysisStatus(
+        `Calibrazione nuova scartata (RMSE ${rmseTxt}); avvio analisi con calibrazione attiva (RMSE ${activeTxt})...`,
+        true
+      );
+      await new Promise((r) => setTimeout(r, 420));
+      startReadingAnalysis({
+        durationMs: 22000,
+        auto: true,
+        calibration: finalCal.appliedStats,
+        calibrationAttempted: finalCal.stats
+      });
+      return;
+    }
+
+    if (!finalCal.ok) {
+      // Still run analysis to capture diagnostics when calibration cannot complete.
+      setAnalysisStatus("Calibrazione non valida; avvio analisi diagnostica comunque...", true);
+      await new Promise((r) => setTimeout(r, 420));
+      startReadingAnalysis({
+        durationMs: 22000,
+        auto: true,
+        calibration: finalCal.appliedStats,
+        calibrationAttempted: finalCal.stats
+      });
+      return;
+    }
+
+    startReadingAnalysis({
+      durationMs: 22000,
+      auto: true,
+      calibration: finalCal.appliedStats,
+      calibrationAttempted: finalCal.stats
+    });
   } finally {
     ANALYSIS.autoPipeline = false;
   }
@@ -1864,11 +2173,27 @@ const { overlay: calOverlay, dot: calDot, status: calStatus } = makeOverlay();
 let calibrating = false;
 
 async function calibrate3x3(): Promise<CalibrationRunResult> {
-  if (calibrating) return { ok: false, aborted: false, stats: null };
+  if (calibrating) {
+    return {
+      ok: false,
+      aborted: false,
+      qualityRejected: false,
+      stats: null,
+      appliedStats: loadCalibrationStatsFromStorage()
+    };
+  }
   calibrating = true;
   calOverlay.style.display = "block";
   calStatus.textContent = "Calibration started…";
-  let result: CalibrationRunResult = { ok: false, aborted: false, stats: null };
+  const prevCalibStorage = localStorage.getItem(CALIB_STORAGE_KEY);
+  const prevCalibStats = prevCalibStorage != null ? loadCalibrationStatsFromStorage() : null;
+  let result: CalibrationRunResult = {
+    ok: false,
+    aborted: false,
+    qualityRejected: false,
+    stats: null,
+    appliedStats: prevCalibStats
+  };
 
   function robustMean(values: number[]) {
     if (values.length === 0) return 0;
@@ -2033,7 +2358,7 @@ async function calibrate3x3(): Promise<CalibrationRunResult> {
 
     if (abort.v) {
       calStatus.textContent = "Calibration aborted.";
-      result = { ok: false, aborted: true, stats: null };
+      result = { ok: false, aborted: true, qualityRejected: false, stats: null, appliedStats: prevCalibStats };
       await new Promise(r => setTimeout(r, 350));
     } else if (samples.length >= 18) {
       let m = gaze.fitAndSetCalibration(samples);
@@ -2054,31 +2379,85 @@ async function calibrate3x3(): Promise<CalibrationRunResult> {
         }
 
         const stats = evalCalibration(samples, m);
-        const calStats: CalibrationStats = {
+        const calStatsBase: CalibrationStats = {
           rmse: stats.rmse,
           maxErr: stats.maxErr,
           leftRmse: stats.leftRmse,
           rightRmse: stats.rightRmse,
           points: samples.length
         };
-        gaze.saveCalibrationToStorage();
         const l = stats.leftRmse == null ? "n/a" : stats.leftRmse.toFixed(3);
         const r = stats.rightRmse == null ? "n/a" : stats.rightRmse.toFixed(3);
-        if (stats.leftRmse != null && stats.rightRmse != null && stats.rightRmse > stats.leftRmse * 1.35) {
-          calStatus.textContent = `Calibration saved. RMSE ${stats.rmse.toFixed(3)} L/R ${l}/${r} (right weaker)`;
+
+        const sideWorst = Math.max(stats.leftRmse ?? 0, stats.rightRmse ?? 0);
+        const sideBest = Math.max(1e-6, Math.min(stats.leftRmse ?? sideWorst, stats.rightRmse ?? sideWorst));
+        const sideRatio = sideWorst / sideBest;
+        const sideImbalance = sideWorst > CALIB_SIDE_RMSE_MAX && sideRatio > CALIB_SIDE_RATIO_MAX;
+        const rejectByRmse = stats.rmse > CALIB_RMSE_ACCEPT_MAX;
+        const hasUsablePreviousStats = prevCalibStats != null;
+        const strictAccepted = !rejectByRmse && !sideImbalance;
+        const provisionalCandidate =
+          !sideImbalance &&
+          rejectByRmse &&
+          stats.rmse <= CALIB_RMSE_PROVISIONAL_MAX &&
+          stats.maxErr <= CALIB_MAXERR_PROVISIONAL_MAX &&
+          sideWorst <= CALIB_SIDE_RMSE_PROVISIONAL_MAX &&
+          sideRatio <= CALIB_SIDE_RATIO_PROVISIONAL_MAX;
+        const provisionalAllowed = provisionalCandidate && !hasUsablePreviousStats;
+
+        if (!strictAccepted && !provisionalAllowed) {
+          // Reject poor fits and restore previous calibration state.
+          if (prevCalibStorage != null) {
+            localStorage.setItem(CALIB_STORAGE_KEY, prevCalibStorage);
+            if (!gaze.loadCalibrationFromStorage(CALIB_STORAGE_KEY)) gaze.clearCalibration(CALIB_STORAGE_KEY);
+          } else {
+            gaze.clearCalibration(CALIB_STORAGE_KEY);
+          }
+          saveCalibrationStatsToStorage(prevCalibStats);
+          if (rejectByRmse) {
+            calStatus.textContent = `Calibration rejected. RMSE ${stats.rmse.toFixed(3)} > ${CALIB_RMSE_ACCEPT_MAX.toFixed(2)}.`;
+          } else {
+            calStatus.textContent = `Calibration rejected. L/R imbalance ${sideRatio.toFixed(2)} (worst ${sideWorst.toFixed(3)}).`;
+          }
+          result = {
+            ok: false,
+            aborted: false,
+            qualityRejected: true,
+            stats: calStatsBase,
+            appliedStats: prevCalibStats
+          };
         } else {
-          calStatus.textContent = `Calibration saved. RMSE ${stats.rmse.toFixed(3)} L/R ${l}/${r} max ${stats.maxErr.toFixed(3)} points ${samples.length}`;
+          const calStats: CalibrationStats = {
+            ...calStatsBase,
+            tier: provisionalAllowed ? "provisional" : "strict"
+          };
+          gaze.saveCalibrationToStorage(CALIB_STORAGE_KEY);
+          saveCalibrationStatsToStorage(calStats);
+          if (provisionalAllowed) {
+            calStatus.textContent =
+              `Calibration provisional. RMSE ${stats.rmse.toFixed(3)} (<= ${CALIB_RMSE_PROVISIONAL_MAX.toFixed(2)}), L/R ${l}/${r}`;
+          } else if (stats.leftRmse != null && stats.rightRmse != null && stats.rightRmse > stats.leftRmse * 1.35) {
+            calStatus.textContent = `Calibration saved. RMSE ${stats.rmse.toFixed(3)} L/R ${l}/${r} (right weaker)`;
+          } else {
+            calStatus.textContent = `Calibration saved. RMSE ${stats.rmse.toFixed(3)} L/R ${l}/${r} max ${stats.maxErr.toFixed(3)} points ${samples.length}`;
+          }
+          result = {
+            ok: true,
+            aborted: false,
+            qualityRejected: false,
+            stats: calStats,
+            appliedStats: calStats
+          };
         }
-        result = { ok: true, aborted: false, stats: calStats };
       } else {
         calStatus.textContent = "Calibration failed. Retry.";
-        result = { ok: false, aborted: false, stats: null };
+        result = { ok: false, aborted: false, qualityRejected: false, stats: null, appliedStats: prevCalibStats };
       }
       console.log("Calibration matrix:", m);
       await new Promise(r => setTimeout(r, 550));
     } else {
       calStatus.textContent = "Not enough valid samples. Retry with better lighting.";
-      result = { ok: false, aborted: false, stats: null };
+      result = { ok: false, aborted: false, qualityRejected: false, stats: null, appliedStats: prevCalibStats };
       await new Promise(r => setTimeout(r, 650));
     }
   } finally {
@@ -2379,8 +2758,11 @@ function attachVideosIfReady() {
 
 // ---------- SENDER META ----------
 function computePatchRectTopLeft(gaze: THREE.Vector2) {
-  const cx = (gaze.x * 0.5 + 0.5) * FULL_W;
-  const cy = (-gaze.y * 0.5 + 0.5) * FULL_H; // top-left origin (NDC Y+ is up, screen Y+ is down)
+  // Sensitivity shaping: compress patch movement against gaze to reduce perceived over-reactivity.
+  const gx = clamp(gaze.x * PATCH_SENSITIVITY_X, -1, 1);
+  const gy = clamp(gaze.y * PATCH_SENSITIVITY_Y, -1, 1);
+  const cx = (gx * 0.5 + 0.5) * FULL_W;
+  const cy = (-gy * 0.5 + 0.5) * FULL_H; // top-left origin (NDC Y+ is up, screen Y+ is down)
 
   // Keep this path deterministic: gazeForPatch is already smoothed by updatePatchFocus().
   const maxX = FULL_W - PATCH_W;
@@ -2505,7 +2887,9 @@ patch kbps: ${patchK}
 gpu recv:   ${recvGpu != null ? recvGpu.toFixed(2) : "…"} ms
 rectN:      ${patchRectN.toArray().map(v=>v.toFixed(3)).join(", ")}
 gaze ctrl:  ${gazeNDC.x.toFixed(3)}, ${gazeNDC.y.toFixed(3)}
+gaze est:   ${gazeEstNDC.x.toFixed(3)}, ${gazeEstNDC.y.toFixed(3)}
 gaze filt:  ${gazeFocusNDC.x.toFixed(3)}, ${gazeFocusNDC.y.toFixed(3)}
+mode:       ${gazeFilterMode}
 mask:       r=${FOVEA_R.toFixed(2)} f=${FEATHER.toFixed(2)}`;
   }
 }
@@ -2546,13 +2930,14 @@ function tick(t: number) {
   } else if (!recentlyLostEye) {
     gazeNDC.lerp(mouseNDC, MOUSE_FOLLOW_SLOW);
   }
-  updatePatchFocus(gazeNDC, useEye);
+  updateGazeEstimate(gazeNDC, useEye, gf.conf, t);
+  updatePatchFocus(gazeEstNDC, useEye, gf.conf, gazeFilterMode);
   const gazeForPatch = gazeFocusNDC;
 
   update(t);
 
   computePatchRectTopLeft(gazeForPatch);
-  captureReadingAnalysisSample(t, gf, useEye, gazeNDC, gazeForPatch);
+  captureReadingAnalysisSample(t, gf, useEye, gazeNDC, gazeForPatch, gazeEstNDC, gazeFilterMode);
 
   const timeSec = t * 0.001;
 
@@ -2849,6 +3234,7 @@ function tick(t: number) {
       // Update TEL for allocator access (before telemetry sample)
       TEL.useEye = useEye;
       TEL.gazeConf = useEye ? gf.conf : 0;
+      TEL.gazeMode = gazeFilterMode;
       
       // Calculate ROI size for telemetry (same as in PATCH rendering)
       const telRoiW = ROI_W;
@@ -2861,8 +3247,11 @@ function tick(t: number) {
         // gaze
         gaze_x: +gazeNDC.x.toFixed(4),
         gaze_y: +gazeNDC.y.toFixed(4),
+        gaze_est_x: +gazeEstNDC.x.toFixed(4),
+        gaze_est_y: +gazeEstNDC.y.toFixed(4),
         gaze_filt_x: +gazeForPatch.x.toFixed(4),
         gaze_filt_y: +gazeForPatch.y.toFixed(4),
+        gaze_mode: TEL.gazeMode,
         use_eye: !!useEye,
         conf: +(useEye ? gf.conf : 0).toFixed(3),
 
@@ -2959,6 +3348,7 @@ eye conf:   ${gf.conf.toFixed(2)} ${gf.hasIris ? "iris" : "head"}
 gaze raw:   ${gf.rawX.toFixed(3)}, ${gf.rawY.toFixed(3)}
 gaze eye:   ${gf.gazeX.toFixed(3)}, ${gf.gazeY.toFixed(3)}
 gaze ctrl:  ${gazeNDC.x.toFixed(3)}, ${gazeNDC.y.toFixed(3)}
+gaze est:   ${gazeEstNDC.x.toFixed(3)}, ${gazeEstNDC.y.toFixed(3)}  (${gazeFilterMode})
 gaze filt:  ${gazeForPatch.x.toFixed(3)}, ${gazeForPatch.y.toFixed(3)}`;
     } catch (err) {
       console.error("Error updating sender stats:", err);
