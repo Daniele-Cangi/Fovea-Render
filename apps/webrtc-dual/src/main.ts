@@ -135,23 +135,76 @@ function telEvent(name: string, data: Record<string, any> = {}) {
   });
 }
 
-function telDownload() {
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const blob = new Blob([TEL.lines.join("\n") + "\n"], { type: "application/jsonl" });
+function makeStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function downloadTextFile(fileName: string, text: string, mimeType = "text/plain") {
+  const blob = new Blob([text], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `telemetry_${stamp}.jsonl`;
+  a.download = fileName;
   document.body.appendChild(a);
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
 }
 
+function telDownload() {
+  const stamp = makeStamp();
+  downloadTextFile(`telemetry_${stamp}.jsonl`, TEL.lines.join("\n") + "\n", "application/jsonl");
+}
+
 function telClear() {
   TEL.lines.length = 0;
   TEL.seq = 0;
 }
+
+type CalibrationStats = {
+  rmse: number;
+  maxErr: number;
+  leftRmse: number | null;
+  rightRmse: number | null;
+  points: number;
+};
+
+type CalibrationRunResult = {
+  ok: boolean;
+  aborted: boolean;
+  stats: CalibrationStats | null;
+};
+
+type ReadingAnalysisSample = {
+  t_ms: number;
+  use_eye: boolean;
+  conf: number;
+  raw_x: number;
+  raw_y: number;
+  eye_x: number;
+  eye_y: number;
+  ctrl_x: number;
+  ctrl_y: number;
+  filt_x: number;
+  filt_y: number;
+  patch_cx: number;
+  patch_cy: number;
+};
+
+type ReadingAnalysisStopReason = "manual" | "timeout" | "aborted";
+
+const ANALYSIS = {
+  running: false,
+  auto: false,
+  autoPipeline: false,
+  startedAtMs: 0,
+  stopAtMs: 0,
+  overlay: null as HTMLDivElement | null,
+  statusEl: null as HTMLDivElement | null,
+  samples: [] as ReadingAnalysisSample[],
+  calibration: null as CalibrationStats | null,
+  lastSummary: null as Record<string, unknown> | null
+};
 
 // ------------------- BANDWIDTH GOVERNOR -------------------
 type BwProfileName = "mobile" | "balanced" | "lan";
@@ -280,6 +333,19 @@ window.addEventListener("keydown", (e) => {
   if (k === "=" || k === "+") GOV.targetGpuMs = clamp(GOV.targetGpuMs + 0.5, 4, 20);
   if (k === "-" || k === "_") GOV.targetGpuMs = clamp(GOV.targetGpuMs - 0.5, 4, 20);
   if (k === "l") LOD_ON = !LOD_ON;
+  if (k === "m") {
+    patchMode = (patchMode + 1) % PATCH_MODE_COUNT;
+    telEvent("workload_mode", { patchMode });
+  }
+  if (k === "c") {
+    if (e.shiftKey) void calibrate3x3();
+    else void runCalibrationThenReadingAnalysis();
+  }
+  if (k === "r") {
+    if (ANALYSIS.running) stopReadingAnalysis("manual");
+    else startReadingAnalysis({ durationMs: 22000, auto: false, calibration: null });
+  }
+  if (k === "a") void runCalibrationThenReadingAnalysis();
   if (k === "t") TEL.enabled = !TEL.enabled; // toggle
   if (k === "d") telDownload();
   if (k === "x") telClear();
@@ -1006,17 +1072,6 @@ function startBitratePoller(opts: {
   return { stop };
 }
 
-window.addEventListener("keydown", (e) => {
-  const k = e.key.toLowerCase();
-  if (k === "g") GOV.enabled = !GOV.enabled;
-  if (k === "=" || k === "+") GOV.targetGpuMs = clamp(GOV.targetGpuMs + 0.5, 4, 20);
-  if (k === "-" || k === "_") GOV.targetGpuMs = clamp(GOV.targetGpuMs - 0.5, 4, 20);
-  if (k === "l") LOD_ON = !LOD_ON;
-  if (k === "t") TEL.enabled = !TEL.enabled; // toggle
-  if (k === "d") telDownload();
-  if (k === "x") telClear();
-});
-
 // ---------- DOM ----------
 const cLow = document.getElementById("cLow") as HTMLCanvasElement;
 const cPatch = document.getElementById("cPatch") as HTMLCanvasElement;
@@ -1050,29 +1105,437 @@ cOut.style.width = "640px"; cOut.style.height = "360px"; // Smaller receiver
 
 // ---------- GAZE (eye tracking + mouse fallback) ----------
 const gazeNDC = new THREE.Vector2(0, 0);
-const gazePatchNDC = new THREE.Vector2(0, 0);
 const mouseNDC = new THREE.Vector2(0, 0);
 let LOD_ON = true;
 
-// Patch-rect smoothing
-let patchX0 = 0;
-let patchY0 = 0;
-let patchInit = false;
-
-// Confidence hysteresis
+// Confidence hysteresis + graceful eye->mouse fallback.
 let eyeLock = false;
-const ENTER_CONF = 0.35;
-const EXIT_CONF = 0.22;
+let eyeEverLocked = false;
+let eyeLostAtMs = -1;
+const ENTER_CONF = 0.40;
+const EXIT_CONF = 0.18;
+const EYE_HOLD_MS = 900;
+const MOUSE_FOLLOW_FAST = 0.55;
+const MOUSE_FOLLOW_SLOW = 0.10;
+
+// Additional smoothing dedicated to patch positioning/zoom window.
+const gazeFocusNDC = new THREE.Vector2(0, 0);
+let gazeFocusInit = false;
+const FOCUS_DEADZONE = 0.018;
+const FOCUS_DEADZONE_X = 0.022;
+const FOCUS_DEADZONE_Y = 0.018;
+const FOCUS_SLOW = 0.17;
+const FOCUS_FAST = 0.30;
+const FOCUS_SUPER_FAST = 0.48;
+const FOCUS_MED_DIST = 0.12;
+const FOCUS_BIG_DIST = 0.30;
+const FOCUS_MAX_STEP = 0.035;
+const FOCUS_MAX_STEP_X = 0.028;
+const FOCUS_MAX_STEP_Y = 0.030;
+const FOCUS_MOUSE_FOLLOW = 0.45;
+const PATCH_EDGE_SNAP_PX = 3;
+const PATCH_DEADBAND_X_PX = 2;
+const PATCH_DEADBAND_Y_PX = 0;
+const PATCH_QUANT_X_PX = 2;
+const PATCH_QUANT_Y_PX = 1;
+const PATCH_EDGE_LOCK_X_PX = 6;
+const PATCH_EDGE_RELEASE_X_PX = 14;
+const PATCH_EDGE_LOCK_Y_PX = 0;
+const PATCH_EDGE_RELEASE_Y_PX = 0;
+let patchRectAppliedInit = false;
+let patchRectAppliedX = 0;
+let patchRectAppliedY = 0;
+
+function updatePatchFocus(target: THREE.Vector2, useEye: boolean) {
+  if (!gazeFocusInit) {
+    gazeFocusInit = true;
+    gazeFocusNDC.copy(target);
+    return;
+  }
+
+  if (!useEye) {
+    // Mouse fallback should stay responsive.
+    gazeFocusNDC.lerp(target, FOCUS_MOUSE_FOLLOW);
+    return;
+  }
+
+  const dx = target.x - gazeFocusNDC.x;
+  const dy = target.y - gazeFocusNDC.y;
+  const effDx = Math.abs(dx) < FOCUS_DEADZONE_X ? 0 : dx;
+  const effDy = Math.abs(dy) < FOCUS_DEADZONE_Y ? 0 : dy;
+  if (effDx === 0 && effDy === 0) return;
+
+  const dist = Math.sqrt(effDx * effDx + effDy * effDy);
+  if (dist < FOCUS_DEADZONE) return;
+
+  let follow = FOCUS_SLOW;
+  if (dist > FOCUS_BIG_DIST) follow = FOCUS_SUPER_FAST;
+  else if (dist > FOCUS_MED_DIST) follow = FOCUS_FAST;
+  const maxStep = dist > 0.35 ? (FOCUS_MAX_STEP * 1.35) : FOCUS_MAX_STEP;
+  const maxStepX = Math.min(maxStep, FOCUS_MAX_STEP_X);
+  const maxStepY = Math.min(maxStep, FOCUS_MAX_STEP_Y);
+  const stepX = clamp(effDx * follow, -maxStepX, maxStepX);
+  const stepY = clamp(effDy * follow, -maxStepY, maxStepY);
+
+  gazeFocusNDC.set(
+    clamp(gazeFocusNDC.x + stepX, -1, 1),
+    clamp(gazeFocusNDC.y + stepY, -1, 1)
+  );
+}
 
 // ---------- WORKLOAD ENCODER STATE ----------
-let patchMode = 0; // 0=dark, 1=text, 2=checkerboard+line, 3=temporal noise
-let cursorX = 0.5; // normalized 0-1
-let cursorY = 0.5; // normalized 0-1
-const ROI_W = Math.floor(PATCH_W * 0.6); // ROI width: 60% of patch canvas
-const ROI_H = Math.floor(PATCH_H * 0.6); // ROI height: 60% of patch canvas
+const PATCH_MODE_COUNT = 5;
+const PATCH_MODE_LABELS = ["minimal", "text-scroll", "checker", "noise", "reading-zoom"];
+let patchMode = 4; // default to reading demo
+const ROI_SCALE = 0.78; // Bigger focus box for easier visual validation
+const ROI_W = Math.floor(PATCH_W * ROI_SCALE);
+const ROI_H = Math.floor(PATCH_H * ROI_SCALE);
+
+const READING_SUPERSAMPLE = 2;
+const readingCanvas = document.createElement("canvas");
+readingCanvas.width = PATCH_W * READING_SUPERSAMPLE;
+readingCanvas.height = PATCH_H * READING_SUPERSAMPLE;
+const readingCtx = readingCanvas.getContext("2d", { alpha: false });
+if (!readingCtx) throw new Error("Failed to create reading demo canvas");
+
+function drawWrappedText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  lineHeight: number
+) {
+  const words = text.split(" ");
+  let line = "";
+  let yy = y;
+
+  for (const w of words) {
+    const candidate = line ? `${line} ${w}` : w;
+    if (ctx.measureText(candidate).width > maxWidth && line) {
+      ctx.fillText(line, x, yy);
+      yy += lineHeight;
+      line = w;
+    } else {
+      line = candidate;
+    }
+  }
+  if (line) {
+    ctx.fillText(line, x, yy);
+    yy += lineHeight;
+  }
+  return yy;
+}
+
+function drawReadingDemoPage(ctx: CanvasRenderingContext2D, _tSec: number) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, readingCanvas.width, readingCanvas.height);
+  ctx.setTransform(READING_SUPERSAMPLE, 0, 0, READING_SUPERSAMPLE, 0, 0);
+
+  ctx.fillStyle = "#f6f2e8";
+  ctx.fillRect(0, 0, PATCH_W, PATCH_H);
+
+  ctx.fillStyle = "#1d1d1d";
+  ctx.font = "bold 30px Georgia, serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText("Foveated Reading Demo", 28, 18);
+
+  ctx.fillStyle = "#4a4a4a";
+  ctx.font = "17px Georgia, serif";
+  ctx.fillText("Leggi il testo: il riquadro zoom deve seguire il tuo sguardo.", 28, 58);
+
+  const paragraphs = [
+    "La resa foveata mostra piu dettaglio nella zona osservata e riduce il costo nella periferia.",
+    "Quando il tracking e calibrato bene, il testo resta nitido vicino al punto in cui stai guardando.",
+    "Se noti jitter o salti, ripeti la calibrazione in luce uniforme e mantieni la testa piu stabile.",
+    "Sposta lo sguardo tra sinistra, centro e destra: il riquadro dovrebbe seguire in modo fluido."
+  ];
+
+  ctx.fillStyle = "#292929";
+  ctx.font = "22px Georgia, serif";
+  let y = 118;
+  for (const p of paragraphs) {
+    y = drawWrappedText(ctx, p, 34, y, PATCH_W - 68, 30) + 10;
+  }
+
+  const markerY = 474;
+  ctx.fillStyle = "rgba(255, 188, 88, 0.24)";
+  ctx.fillRect(28, markerY, PATCH_W - 56, 38);
+  ctx.strokeStyle = "rgba(200, 120, 30, 0.72)";
+  ctx.lineWidth = 1.7;
+  ctx.strokeRect(28, markerY, PATCH_W - 56, 38);
+
+  ctx.fillStyle = "#373737";
+  ctx.font = "19px Georgia, serif";
+  ctx.fillText("Riga guida: prova a fissare questa frase per 2 secondi.", 36, markerY + 8);
+
+  // Page frame
+  ctx.strokeStyle = "rgba(0,0,0,0.24)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(16, 12, PATCH_W - 32, PATCH_H - 24);
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+function ensureAnalysisOverlay() {
+  if (ANALYSIS.overlay && ANALYSIS.statusEl) return;
+  const o = document.createElement("div");
+  o.style.position = "fixed";
+  o.style.left = "14px";
+  o.style.bottom = "14px";
+  o.style.maxWidth = "560px";
+  o.style.padding = "10px 12px";
+  o.style.background = "rgba(8,12,18,0.72)";
+  o.style.border = "1px solid rgba(150, 205, 255, 0.45)";
+  o.style.borderRadius = "8px";
+  o.style.color = "#d7ebff";
+  o.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
+  o.style.fontSize = "12px";
+  o.style.lineHeight = "1.4";
+  o.style.zIndex = "9998";
+  o.style.pointerEvents = "none";
+  o.style.display = "none";
+  o.innerHTML = `
+    <div><b>Reading Analysis</b> (auto-record)</div>
+    <div id="analysis-status" style="margin-top:4px;opacity:0.95;">Idle</div>
+  `;
+  document.body.appendChild(o);
+  ANALYSIS.overlay = o;
+  ANALYSIS.statusEl = o.querySelector("#analysis-status") as HTMLDivElement;
+}
+
+function setAnalysisStatus(msg: string, visible = true) {
+  ensureAnalysisOverlay();
+  if (ANALYSIS.statusEl) ANALYSIS.statusEl.textContent = msg;
+  if (ANALYSIS.overlay) ANALYSIS.overlay.style.display = visible ? "block" : "none";
+}
+
+function hideAnalysisStatus(delayMs = 0) {
+  ensureAnalysisOverlay();
+  if (delayMs <= 0) {
+    if (!ANALYSIS.running && ANALYSIS.overlay) ANALYSIS.overlay.style.display = "none";
+    return;
+  }
+  window.setTimeout(() => {
+    if (!ANALYSIS.running && ANALYSIS.overlay) ANALYSIS.overlay.style.display = "none";
+  }, delayMs);
+}
+
+function percentile(values: number[], q: number) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = clamp(Math.floor((sorted.length - 1) * q), 0, sorted.length - 1);
+  return sorted[idx];
+}
+
+function mean(values: number[]) {
+  if (values.length === 0) return 0;
+  return values.reduce((s, v) => s + v, 0) / values.length;
+}
+
+function rmsStep(
+  samples: ReadingAnalysisSample[],
+  include: (_prev: ReadingAnalysisSample, _cur: ReadingAnalysisSample) => boolean
+) {
+  let se = 0;
+  let n = 0;
+  for (let i = 1; i < samples.length; i++) {
+    const prev = samples[i - 1];
+    const cur = samples[i];
+    if (!include(prev, cur)) continue;
+    const dx = cur.filt_x - prev.filt_x;
+    const dy = cur.filt_y - prev.filt_y;
+    se += dx * dx + dy * dy;
+    n++;
+  }
+  return n > 0 ? Math.sqrt(se / n) : 0;
+}
+
+function countEyeDropouts(samples: ReadingAnalysisSample[]) {
+  let cnt = 0;
+  let inDrop = false;
+  for (const s of samples) {
+    if (!s.use_eye) {
+      if (!inDrop) {
+        cnt++;
+        inDrop = true;
+      }
+    } else {
+      inDrop = false;
+    }
+  }
+  return cnt;
+}
+
+function buildReadingAnalysisSummary(
+  reason: ReadingAnalysisStopReason,
+  samples: ReadingAnalysisSample[],
+  durationMs: number,
+  calibration: CalibrationStats | null
+) {
+  const confVals = samples.map((s) => s.conf);
+  const eyeSamples = samples.filter((s) => s.use_eye);
+  const eyeConfVals = eyeSamples.map((s) => s.conf);
+  const eyeUsageRatio = samples.length > 0 ? eyeSamples.length / samples.length : 0;
+  const jitterAll = rmsStep(samples, () => true);
+  const jitterLeft = rmsStep(samples, (_p, c) => c.filt_x < 0);
+  const jitterRight = rmsStep(samples, (_p, c) => c.filt_x >= 0);
+  const rightLeftRatio = jitterLeft > 1e-6 ? (jitterRight / jitterLeft) : null;
+  const ctrlVsFilt = mean(samples.map((s) => Math.hypot(s.ctrl_x - s.filt_x, s.ctrl_y - s.filt_y)));
+  const patchTrackErr = mean(samples.map((s) => {
+    const nx = (s.filt_x + 1) * 0.5;
+    const ny = (-s.filt_y + 1) * 0.5;
+    return Math.hypot(nx - s.patch_cx, ny - s.patch_cy);
+  }));
+  const dropouts = countEyeDropouts(samples);
+
+  const notes: string[] = [];
+  if (eyeUsageRatio < 0.70) notes.push("Eye lock debole: troppi fallback o perdita confidenza.");
+  if (rightLeftRatio != null && rightLeftRatio > 1.20) notes.push("Instabilita maggiore a destra rispetto a sinistra.");
+  if (patchTrackErr > 0.080) notes.push("Lag/mismatch visibile tra gaze filtrato e centro patch.");
+  if (percentile(confVals, 0.10) < 0.25) notes.push("Confidenza spesso bassa: migliorare luce e posizione camera.");
+  if (notes.length === 0) notes.push("Sessione abbastanza stabile; resta da rifinire tuning fine.");
+
+  return {
+    version: 1,
+    created_at_iso: new Date().toISOString(),
+    reason,
+    duration_ms: Math.round(durationMs),
+    samples: samples.length,
+    calibration,
+    metrics: {
+      eye_usage_ratio: +eyeUsageRatio.toFixed(4),
+      conf_mean: +mean(confVals).toFixed(4),
+      conf_p10: +percentile(confVals, 0.10).toFixed(4),
+      conf_p90: +percentile(confVals, 0.90).toFixed(4),
+      conf_mean_when_eye: +mean(eyeConfVals).toFixed(4),
+      jitter_rms_step_all: +jitterAll.toFixed(6),
+      jitter_rms_step_left: +jitterLeft.toFixed(6),
+      jitter_rms_step_right: +jitterRight.toFixed(6),
+      jitter_right_left_ratio: rightLeftRatio == null ? null : +rightLeftRatio.toFixed(4),
+      ctrl_vs_filt_mean_dist: +ctrlVsFilt.toFixed(6),
+      patch_track_error_mean: +patchTrackErr.toFixed(6),
+      eye_dropouts: dropouts
+    },
+    notes
+  };
+}
+
+function startReadingAnalysis(opts: {
+  durationMs?: number;
+  auto: boolean;
+  calibration: CalibrationStats | null;
+}) {
+  if (ANALYSIS.running) return false;
+  const durationMs = opts.durationMs ?? 22000;
+  ANALYSIS.running = true;
+  ANALYSIS.auto = opts.auto;
+  ANALYSIS.startedAtMs = performance.now();
+  ANALYSIS.stopAtMs = ANALYSIS.startedAtMs + durationMs;
+  ANALYSIS.samples.length = 0;
+  ANALYSIS.calibration = opts.calibration;
+  patchMode = 4;
+  setAnalysisStatus(
+    `Analisi ${opts.auto ? "AUTO" : "MANUALE"} in corso: leggi il testo nel riquadro (${Math.ceil(durationMs / 1000)}s).`,
+    true
+  );
+  telEvent("reading_analysis_start", { auto: opts.auto, duration_ms: durationMs });
+  return true;
+}
+
+function stopReadingAnalysis(reason: ReadingAnalysisStopReason) {
+  if (!ANALYSIS.running) return;
+  ANALYSIS.running = false;
+  const endedAtMs = performance.now();
+  const durationMs = Math.max(0, endedAtMs - ANALYSIS.startedAtMs);
+  const summary = buildReadingAnalysisSummary(reason, ANALYSIS.samples, durationMs, ANALYSIS.calibration);
+  ANALYSIS.lastSummary = summary as Record<string, unknown>;
+
+  const stamp = makeStamp();
+  const rawJsonl = ANALYSIS.samples.map((s) => JSON.stringify(s)).join("\n") + "\n";
+  const summaryJson = JSON.stringify(summary, null, 2) + "\n";
+  downloadTextFile(`reading_analysis_raw_${stamp}.jsonl`, rawJsonl, "application/jsonl");
+  downloadTextFile(`reading_analysis_summary_${stamp}.json`, summaryJson, "application/json");
+  try {
+    localStorage.setItem("fovea.readingAnalysis.lastSummary", summaryJson);
+  } catch {
+    // Ignore storage failures (quota/private mode) and keep downloaded files as source of truth.
+  }
+
+  const ratio = summary.metrics.jitter_right_left_ratio;
+  setAnalysisStatus(
+    `Analisi salvata (${summary.samples} campioni). jitterR/L=${ratio == null ? "n/a" : ratio.toFixed(2)} conf=${summary.metrics.conf_mean.toFixed(2)}`,
+    true
+  );
+  hideAnalysisStatus(3500);
+  telEvent("reading_analysis_done", {
+    reason,
+    samples: summary.samples,
+    eye_usage_ratio: summary.metrics.eye_usage_ratio,
+    conf_mean: summary.metrics.conf_mean,
+    jitter_right_left_ratio: summary.metrics.jitter_right_left_ratio
+  });
+}
+
+function captureReadingAnalysisSample(
+  tMs: number,
+  gf: ReturnType<MediapipeGazeProvider["getFrame"]>,
+  useEye: boolean,
+  gazeCtrl: THREE.Vector2,
+  gazeFilt: THREE.Vector2
+) {
+  if (!ANALYSIS.running) return;
+  const patchCx = patchRectN.x + patchRectN.z * 0.5;
+  const patchCy = patchRectN.y + patchRectN.w * 0.5;
+  ANALYSIS.samples.push({
+    t_ms: Math.round(tMs),
+    use_eye: useEye,
+    conf: +gf.conf.toFixed(6),
+    raw_x: +gf.rawX.toFixed(6),
+    raw_y: +gf.rawY.toFixed(6),
+    eye_x: +gf.gazeX.toFixed(6),
+    eye_y: +gf.gazeY.toFixed(6),
+    ctrl_x: +gazeCtrl.x.toFixed(6),
+    ctrl_y: +gazeCtrl.y.toFixed(6),
+    filt_x: +gazeFilt.x.toFixed(6),
+    filt_y: +gazeFilt.y.toFixed(6),
+    patch_cx: +patchCx.toFixed(6),
+    patch_cy: +patchCy.toFixed(6)
+  });
+
+  const remainMs = Math.max(0, ANALYSIS.stopAtMs - tMs);
+  setAnalysisStatus(
+    `Analisi ${ANALYSIS.auto ? "AUTO" : "MANUALE"}: ${Math.ceil(remainMs / 1000)}s | conf ${gf.conf.toFixed(2)} | samples ${ANALYSIS.samples.length}`,
+    true
+  );
+  if (tMs >= ANALYSIS.stopAtMs) stopReadingAnalysis("timeout");
+}
+
+async function runCalibrationThenReadingAnalysis() {
+  if (ANALYSIS.autoPipeline || ANALYSIS.running || calibrating) return;
+  ANALYSIS.autoPipeline = true;
+  setAnalysisStatus("Routine auto: calibrazione in corso...", true);
+  try {
+    const cal = await calibrate3x3();
+    if (!cal.ok) {
+      setAnalysisStatus(
+        cal.aborted
+          ? "Routine auto annullata: calibrazione interrotta."
+          : "Routine auto annullata: calibrazione non valida.",
+        true
+      );
+      hideAnalysisStatus(2400);
+      return;
+    }
+    startReadingAnalysis({ durationMs: 22000, auto: true, calibration: cal.stats });
+  } finally {
+    ANALYSIS.autoPipeline = false;
+  }
+}
 
 // ---------- META BINARY ENCODER/DECODER ----------
-const META_VER = 1;
+const META_VER = 2;
 let metaSeq = 0;
 
 function encodeMetaBinary(gaze: THREE.Vector2, rect: THREE.Vector4, conf: number, foveaR: number, feather: number) {
@@ -1141,15 +1604,6 @@ function tryDecodeMetaBinary(data: any) {
   };
 }
 
-// toggle per demo enterprise (L = compare)
-window.addEventListener("keydown", (e) => {
-  if (e.key.toLowerCase() === "l") LOD_ON = !LOD_ON;
-  if (e.key.toLowerCase() === "m") {
-    patchMode = (patchMode + 1) % 4;
-    telEvent("workload_mode", { patchMode });
-  }
-});
-
 window.addEventListener("mousemove", (e) => {
   // map within receiver composite area when possible
   const rect = cOut.getBoundingClientRect();
@@ -1161,10 +1615,6 @@ window.addEventListener("mousemove", (e) => {
     THREE.MathUtils.clamp(nx, -1, 1),
     THREE.MathUtils.clamp(ny, -1, 1)
   );
-  
-  // Update cursor position for workload encoder (normalized 0-1)
-  cursorX = THREE.MathUtils.clamp(x, 0, 1);
-  cursorY = THREE.MathUtils.clamp(y, 0, 1);
 });
 
 // ---------- SCENE (fill-rate heavy points additive) ----------
@@ -1376,7 +1826,7 @@ const tLow = new GpuTimer(rLow);
 // Note: tPatch not used for 2D canvas (no GPU timing available)
 
 // ---------- GAZE PROVIDER (MediaPipe) ----------
-const gaze = new MediapipeGazeProvider({ mirrorX: false, smoothAlpha: 0.18 });
+const gaze = new MediapipeGazeProvider({ mirrorX: false, smoothAlpha: 0.20 });
 gaze.loadCalibrationFromStorage(); // se c'è, parte già calibrato
 gaze.start().catch(err => {
   console.warn("Gaze provider failed, using mouse only:", err);
@@ -1396,36 +1846,129 @@ function makeOverlay() {
   o.style.fontSize = "13px";
   o.innerHTML = `
     <div style="position:absolute;top:14px;left:14px;max-width:520px;line-height:1.35;">
-      <b>Calibration</b> (3×3)<br>
-      Keep your gaze on the dot. Don't move your head much.<br>
+      <b>Calibration</b> (5x5 precision mode)<br>
+      Keep your gaze on the dot. Keep your head stable.<br>
       Press <b>ESC</b> to abort. It will auto-save when done.
     </div>
+    <div id="cal-status" style="position:absolute;top:84px;left:14px;color:#9ff;opacity:0.95;">Preparing…</div>
     <div id="cal-dot" style="position:absolute;width:14px;height:14px;border-radius:50%;
       background:#0ff; box-shadow:0 0 18px rgba(0,255,255,0.55); transform:translate(-50%,-50%);"></div>
   `;
   document.body.appendChild(o);
   const dot = o.querySelector("#cal-dot") as HTMLDivElement;
-  return { overlay: o, dot };
+  const status = o.querySelector("#cal-status") as HTMLDivElement;
+  return { overlay: o, dot, status };
 }
 
-const { overlay: calOverlay, dot: calDot } = makeOverlay();
+const { overlay: calOverlay, dot: calDot, status: calStatus } = makeOverlay();
+let calibrating = false;
 
-async function calibrate3x3() {
+async function calibrate3x3(): Promise<CalibrationRunResult> {
+  if (calibrating) return { ok: false, aborted: false, stats: null };
+  calibrating = true;
   calOverlay.style.display = "block";
+  calStatus.textContent = "Calibration started…";
+  let result: CalibrationRunResult = { ok: false, aborted: false, stats: null };
 
-  const grid = [-0.75, 0.0, 0.75];
+  function robustMean(values: number[]) {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const trim = Math.floor(sorted.length * 0.2);
+    const core = (sorted.length - trim * 2) >= 6
+      ? sorted.slice(trim, sorted.length - trim)
+      : sorted;
+    return core.reduce((s, v) => s + v, 0) / core.length;
+  }
+
+  function robustStd(values: number[]) {
+    if (values.length < 2) return 0;
+    const m = robustMean(values);
+    let acc = 0;
+    for (const v of values) {
+      const d = v - m;
+      acc += d * d;
+    }
+    return Math.sqrt(acc / values.length);
+  }
+
+  function projectCalibration(
+    m: {
+      ax: number; bx: number; cx: number;
+      ay: number; by: number; cy: number;
+      pxy?: number; pxx?: number; pyy?: number;
+      qxy?: number; qxx?: number; qyy?: number;
+    },
+    rx: number,
+    ry: number
+  ) {
+    const rx2 = rx * rx;
+    const ry2 = ry * ry;
+    const rxy = rx * ry;
+    const px = m.ax + m.bx * rx + m.cx * ry + (m.pxy ?? 0) * rxy + (m.pxx ?? 0) * rx2 + (m.pyy ?? 0) * ry2;
+    const py = m.ay + m.by * rx + m.cy * ry + (m.qxy ?? 0) * rxy + (m.qxx ?? 0) * rx2 + (m.qyy ?? 0) * ry2;
+    return { x: px, y: py };
+  }
+
+  function evalCalibration(
+    samples: { rx: number; ry: number; x: number; y: number }[],
+    m: {
+      ax: number; bx: number; cx: number;
+      ay: number; by: number; cy: number;
+      pxy?: number; pxx?: number; pyy?: number;
+      qxy?: number; qxx?: number; qyy?: number;
+    }
+  ) {
+    let se = 0;
+    let maxErr = 0;
+    let seLeft = 0;
+    let seRight = 0;
+    let nLeft = 0;
+    let nRight = 0;
+    for (const s of samples) {
+      const pr = projectCalibration(m, s.rx, s.ry);
+      const px = pr.x;
+      const py = pr.y;
+      const dx = px - s.x;
+      const dy = py - s.y;
+      const err = Math.sqrt(dx * dx + dy * dy);
+      se += err * err;
+      maxErr = Math.max(maxErr, err);
+      if (s.x < 0) { seLeft += err * err; nLeft++; }
+      else { seRight += err * err; nRight++; }
+    }
+    const rmse = samples.length > 0 ? Math.sqrt(se / samples.length) : Infinity;
+    const leftRmse = nLeft > 0 ? Math.sqrt(seLeft / nLeft) : null;
+    const rightRmse = nRight > 0 ? Math.sqrt(seRight / nRight) : null;
+    return { rmse, maxErr, leftRmse, rightRmse };
+  }
+
+  const waitMs = 420;
+  const maxFrames = 110;
+  const minGoodFrames = 28;
+  const goodConf = 0.34;
+  const stableStdTarget = 0.020;
+  const stableStdRelaxed = 0.028;
+
+  const grid = [-0.82, -0.41, 0.0, 0.41, 0.82];
   const targets: { x: number; y: number }[] = [];
-  for (const yy of grid) for (const xx of grid) targets.push({ x: xx, y: yy });
+  for (let yi = 0; yi < grid.length; yi++) {
+    const ys = grid[yi];
+    const xs = (yi % 2 === 0) ? grid : [...grid].reverse();
+    for (const x of xs) targets.push({ x, y: ys });
+  }
 
-  const samples: { rx: number; ry: number; x: number; y: number }[] = [];
+  const samples: { rx: number; ry: number; x: number; y: number; w: number }[] = [];
 
   const abort = { v: false };
   const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") abort.v = true; };
   window.addEventListener("keydown", onKey);
 
   try {
-    for (const t of targets) {
+    for (let idx = 0; idx < targets.length; idx++) {
+      const t = targets[idx];
       if (abort.v) break;
+
+      calStatus.textContent = `Point ${idx + 1}/${targets.length} — keep gaze steady`;
 
       // place dot in screen space from NDC (viewport)
       const vw = window.innerWidth;
@@ -1436,45 +1979,115 @@ async function calibrate3x3() {
       calDot.style.top = `${sy}px`;
 
       // settle
-      await new Promise(r => setTimeout(r, 250));
+      await new Promise(r => setTimeout(r, waitMs));
 
-      // collect ~30 frames (use unmirrored raw for calibration)
-      const acc: GazeSample[] = [];
-      for (let i = 0; i < 30; i++) {
-        if (abort.v) break;
-        const f = gaze.getFrame();
-        const rawUnmirrored = gaze.getRawUnmirrored();
-        acc.push({ rawX: rawUnmirrored.rawX, rawY: rawUnmirrored.rawY, t: performance.now(), conf: f.conf });
-        await new Promise(r => requestAnimationFrame(() => r(null)));
+      // collect frames (use unmirrored raw for calibration) with retry on unstable point
+      let captured = false;
+      for (let attempt = 1; attempt <= 2 && !captured && !abort.v; attempt++) {
+        const acc: GazeSample[] = [];
+        for (let i = 0; i < maxFrames; i++) {
+          if (abort.v) break;
+          const f = gaze.getFrame();
+          const rawUnmirrored = gaze.getRawUnmirrored();
+          acc.push({ rawX: rawUnmirrored.rawX, rawY: rawUnmirrored.rawY, t: performance.now(), conf: f.conf });
+
+          if ((i % 6) === 0) {
+            const goodNow = acc.filter(s => s.conf >= goodConf);
+            if (goodNow.length >= minGoodFrames) {
+              const sxNow = robustStd(goodNow.map(s => s.rawX));
+              const syNow = robustStd(goodNow.map(s => s.rawY));
+              if (sxNow <= stableStdTarget && syNow <= stableStdTarget) break;
+            }
+          }
+          await new Promise(r => requestAnimationFrame(() => r(null)));
+        }
+
+        const good = acc.filter(s => s.conf >= goodConf);
+        const fallback = acc.filter(s => s.conf >= 0.24);
+        const use = good.length >= minGoodFrames ? good : fallback;
+        if (use.length < 12) {
+          calStatus.textContent = `Point ${idx + 1}/${targets.length} low confidence, retry ${attempt}/2`;
+          await new Promise(r => setTimeout(r, 220));
+          continue;
+        }
+
+        const rx = robustMean(use.map(s => s.rawX));
+        const ry = robustMean(use.map(s => s.rawY));
+        const meanConf = robustMean(use.map(s => s.conf));
+        const sxUse = robustStd(use.map(s => s.rawX));
+        const syUse = robustStd(use.map(s => s.rawY));
+        const stable = Math.max(sxUse, syUse) <= stableStdRelaxed || meanConf >= 0.65;
+
+        if (!stable && attempt < 2) {
+          calStatus.textContent = `Point ${idx + 1}/${targets.length} unstable (${Math.max(sxUse, syUse).toFixed(3)}), retry`;
+          await new Promise(r => setTimeout(r, 220));
+          continue;
+        }
+
+        const weight = clamp(meanConf * meanConf + 0.15, 0.10, 2.50);
+        samples.push({ rx, ry, x: t.x, y: t.y, w: weight });
+        calStatus.textContent = `Point ${idx + 1}/${targets.length} captured (conf ${meanConf.toFixed(2)}, std ${Math.max(sxUse, syUse).toFixed(3)})`;
+        captured = true;
       }
-
-      // robust average: only frames with conf > 0.25
-      const good = acc.filter(s => s.conf > 0.25);
-      const use = good.length >= 10 ? good : acc;
-
-      const rx = use.reduce((s,p)=>s+p.rawX,0)/use.length;
-      const ry = use.reduce((s,p)=>s+p.rawY,0)/use.length;
-
-      samples.push({ rx, ry, x: t.x, y: t.y });
     }
 
-    if (!abort.v && samples.length >= 6) {
-      const m = gaze.fitAndSetCalibration(samples);
-      if (m) gaze.saveCalibrationToStorage();
+    if (abort.v) {
+      calStatus.textContent = "Calibration aborted.";
+      result = { ok: false, aborted: true, stats: null };
+      await new Promise(r => setTimeout(r, 350));
+    } else if (samples.length >= 18) {
+      let m = gaze.fitAndSetCalibration(samples);
+      if (m) {
+        const first = evalCalibration(samples, m);
+        const thr = Math.max(0.18, first.rmse * 1.9);
+        const inliers = samples.filter((s) => {
+          const p = projectCalibration(m!, s.rx, s.ry);
+          const px = p.x;
+          const py = p.y;
+          const dx = px - s.x;
+          const dy = py - s.y;
+          return Math.sqrt(dx * dx + dy * dy) <= thr;
+        });
+        if (inliers.length >= Math.max(14, Math.floor(samples.length * 0.65))) {
+          const refined = gaze.fitAndSetCalibration(inliers);
+          if (refined) m = refined;
+        }
+
+        const stats = evalCalibration(samples, m);
+        const calStats: CalibrationStats = {
+          rmse: stats.rmse,
+          maxErr: stats.maxErr,
+          leftRmse: stats.leftRmse,
+          rightRmse: stats.rightRmse,
+          points: samples.length
+        };
+        gaze.saveCalibrationToStorage();
+        const l = stats.leftRmse == null ? "n/a" : stats.leftRmse.toFixed(3);
+        const r = stats.rightRmse == null ? "n/a" : stats.rightRmse.toFixed(3);
+        if (stats.leftRmse != null && stats.rightRmse != null && stats.rightRmse > stats.leftRmse * 1.35) {
+          calStatus.textContent = `Calibration saved. RMSE ${stats.rmse.toFixed(3)} L/R ${l}/${r} (right weaker)`;
+        } else {
+          calStatus.textContent = `Calibration saved. RMSE ${stats.rmse.toFixed(3)} L/R ${l}/${r} max ${stats.maxErr.toFixed(3)} points ${samples.length}`;
+        }
+        result = { ok: true, aborted: false, stats: calStats };
+      } else {
+        calStatus.textContent = "Calibration failed. Retry.";
+        result = { ok: false, aborted: false, stats: null };
+      }
       console.log("Calibration matrix:", m);
+      await new Promise(r => setTimeout(r, 550));
+    } else {
+      calStatus.textContent = "Not enough valid samples. Retry with better lighting.";
+      result = { ok: false, aborted: false, stats: null };
+      await new Promise(r => setTimeout(r, 650));
     }
   } finally {
     window.removeEventListener("keydown", onKey);
     calOverlay.style.display = "none";
+    calibrating = false;
   }
+  return result;
 }
-
-window.addEventListener("keydown", (e) => {
-  if (e.key.toLowerCase() === "c") calibrate3x3();
-});
-
-// patch camera uses viewOffset (true crop of the frustum)
-const patchCam = camera.clone();
 
 // rect normalized (0..1) of patch in full frame (sender -> receiver)
 const patchRectN = new THREE.Vector4(0, 0, PATCH_W / FULL_W, PATCH_H / FULL_H);
@@ -1764,63 +2377,77 @@ function attachVideosIfReady() {
   receiverComposite.setPatchVideo(vPatch);
 }
 
-// ---------- SENDER META + PATCH VIEWOFFSET ----------
+// ---------- SENDER META ----------
 function computePatchRectTopLeft(gaze: THREE.Vector2) {
   const cx = (gaze.x * 0.5 + 0.5) * FULL_W;
   const cy = (-gaze.y * 0.5 + 0.5) * FULL_H; // top-left origin (NDC Y+ is up, screen Y+ is down)
 
-  const dx = Math.floor(clamp(cx - PATCH_W / 2, 0, FULL_W - PATCH_W));
-  const dy = Math.floor(clamp(cy - PATCH_H / 2, 0, FULL_H - PATCH_H));
+  // Keep this path deterministic: gazeForPatch is already smoothed by updatePatchFocus().
+  const maxX = FULL_W - PATCH_W;
+  const maxY = FULL_H - PATCH_H;
+  const desiredX = Math.round(clamp(cx - PATCH_W / 2, 0, maxX));
+  const desiredY = Math.round(clamp(cy - PATCH_H / 2, 0, maxY));
 
-  if (!patchInit) {
-    patchInit = true;
-    patchX0 = dx;
-    patchY0 = dy;
-  } else {
-    // smoothing (tune 0.18..0.35)
-    patchX0 = lerp(patchX0, dx, 0.25);
-    patchY0 = lerp(patchY0, dy, 0.25);
+  if (!patchRectAppliedInit) {
+    patchRectAppliedInit = true;
+    patchRectAppliedX = desiredX;
+    patchRectAppliedY = desiredY;
   }
 
-  patchX0 = clamp(patchX0, 0, FULL_W - PATCH_W);
-  patchY0 = clamp(patchY0, 0, FULL_H - PATCH_H);
+  let x0 = desiredX;
+  let y0 = desiredY;
 
-  const x0 = Math.round(patchX0);
-  const y0 = Math.round(patchY0);
+  // Edge hysteresis: avoid chatter when gaze hovers around clamped boundaries.
+  if (
+    PATCH_EDGE_LOCK_X_PX > 0 &&
+    patchRectAppliedX <= PATCH_EDGE_LOCK_X_PX &&
+    desiredX <= PATCH_EDGE_RELEASE_X_PX
+  ) {
+    x0 = 0;
+  } else if (
+    PATCH_EDGE_LOCK_X_PX > 0 &&
+    patchRectAppliedX >= maxX - PATCH_EDGE_LOCK_X_PX &&
+    desiredX >= maxX - PATCH_EDGE_RELEASE_X_PX
+  ) {
+    x0 = maxX;
+  }
+
+  if (
+    PATCH_EDGE_LOCK_Y_PX > 0 &&
+    patchRectAppliedY <= PATCH_EDGE_LOCK_Y_PX &&
+    desiredY <= PATCH_EDGE_RELEASE_Y_PX
+  ) {
+    y0 = 0;
+  } else if (
+    PATCH_EDGE_LOCK_Y_PX > 0 &&
+    patchRectAppliedY >= maxY - PATCH_EDGE_LOCK_Y_PX &&
+    desiredY >= maxY - PATCH_EDGE_RELEASE_Y_PX
+  ) {
+    y0 = maxY;
+  }
+
+  // Pixel deadband + quantization to suppress visible micro-wobble.
+  if (Math.abs(x0 - patchRectAppliedX) <= PATCH_DEADBAND_X_PX) x0 = patchRectAppliedX;
+  if (Math.abs(y0 - patchRectAppliedY) <= PATCH_DEADBAND_Y_PX) y0 = patchRectAppliedY;
+  if (PATCH_QUANT_X_PX > 1) x0 = Math.round(x0 / PATCH_QUANT_X_PX) * PATCH_QUANT_X_PX;
+  if (PATCH_QUANT_Y_PX > 1) y0 = Math.round(y0 / PATCH_QUANT_Y_PX) * PATCH_QUANT_Y_PX;
+  x0 = clamp(x0, 0, maxX);
+  y0 = clamp(y0, 0, maxY);
+
+  // Snap near edges to avoid boundary chatter when gaze hovers around limits.
+  if (x0 <= PATCH_EDGE_SNAP_PX) x0 = 0;
+  else if (x0 >= maxX - PATCH_EDGE_SNAP_PX) x0 = maxX;
+  if (y0 <= PATCH_EDGE_SNAP_PX) y0 = 0;
+  else if (y0 >= maxY - PATCH_EDGE_SNAP_PX) y0 = maxY;
+
+  patchRectAppliedX = x0;
+  patchRectAppliedY = y0;
 
   patchRectN.set(
     x0 / FULL_W,
     y0 / FULL_H,
     PATCH_W / FULL_W,
     PATCH_H / FULL_H
-  );
-
-  patchCam.clearViewOffset();
-  // Convert y0 from top-left origin (screen coords) to bottom-left origin (OpenGL/Three.js coords)
-  const y0_gl = FULL_H - y0 - PATCH_H;
-  patchCam.setViewOffset(FULL_W, FULL_H, x0, y0_gl, PATCH_W, PATCH_H);
-  patchCam.updateProjectionMatrix();
-}
-
-function computeGazePatchNDC(gaze: THREE.Vector2, rectN: THREE.Vector4) {
-  // gaze NDC -> uv bottom-left
-  const u = (gaze.x + 1) * 0.5;
-  const vBL = (gaze.y + 1) * 0.5;
-
-  // convert to top-left for rect math
-  const vTL = 1.0 - vBL;
-
-  // local uv inside rect (top-left origin)
-  const pu = (u - rectN.x) / rectN.z;
-  const pv = (vTL - rectN.y) / rectN.w;
-
-  // uv -> patch NDC (y up)
-  const nx = pu * 2 - 1;
-  const ny = 1 - pv * 2;
-
-  gazePatchNDC.set(
-    THREE.MathUtils.clamp(nx, -1, 1),
-    THREE.MathUtils.clamp(ny, -1, 1)
   );
 }
 
@@ -1877,7 +2504,8 @@ low kbps:   ${lowK}
 patch kbps: ${patchK}
 gpu recv:   ${recvGpu != null ? recvGpu.toFixed(2) : "…"} ms
 rectN:      ${patchRectN.toArray().map(v=>v.toFixed(3)).join(", ")}
-gazeNDC:    ${gazeNDC.x.toFixed(3)}, ${gazeNDC.y.toFixed(3)}
+gaze ctrl:  ${gazeNDC.x.toFixed(3)}, ${gazeNDC.y.toFixed(3)}
+gaze filt:  ${gazeFocusNDC.x.toFixed(3)}, ${gazeFocusNDC.y.toFixed(3)}
 mask:       r=${FOVEA_R.toFixed(2)} f=${FEATHER.toFixed(2)}`;
   }
 }
@@ -1888,25 +2516,43 @@ function tick(t: number) {
   requestAnimationFrame(tick);
   frame++;
 
-  // Choose gaze source: eye tracking with hysteresis
+  // Choose gaze source: eye tracking with hysteresis + graceful fallback.
   const gf = gaze.getFrame();
 
-  // hysteresis
+  // Hysteresis on confidence.
+  const prevEyeLock = eyeLock;
   if (!eyeLock && gf.conf >= ENTER_CONF) eyeLock = true;
   else if (eyeLock && gf.conf <= EXIT_CONF) eyeLock = false;
 
-  const useEye = eyeLock;
-
-  if (useEye) {
-    gazeNDC.set(gf.gazeX, gf.gazeY);
-  } else {
-    gazeNDC.copy(mouseNDC);
+  if (eyeLock) {
+    eyeEverLocked = true;
+    eyeLostAtMs = -1;
+  } else if (prevEyeLock) {
+    eyeLostAtMs = t;
   }
+
+  // Hold the last eye sample briefly to avoid jumps on transient drops.
+  const recentlyLostEye =
+    !eyeLock &&
+    eyeEverLocked &&
+    eyeLostAtMs >= 0 &&
+    (t - eyeLostAtMs) < EYE_HOLD_MS;
+  const useEye = eyeLock || recentlyLostEye;
+
+  if (eyeLock) {
+    gazeNDC.set(gf.gazeX, gf.gazeY);
+  } else if (!eyeEverLocked) {
+    gazeNDC.lerp(mouseNDC, MOUSE_FOLLOW_FAST);
+  } else if (!recentlyLostEye) {
+    gazeNDC.lerp(mouseNDC, MOUSE_FOLLOW_SLOW);
+  }
+  updatePatchFocus(gazeNDC, useEye);
+  const gazeForPatch = gazeFocusNDC;
 
   update(t);
 
-  computePatchRectTopLeft(gazeNDC);
-  computeGazePatchNDC(gazeNDC, patchRectN);
+  computePatchRectTopLeft(gazeForPatch);
+  captureReadingAnalysisSample(t, gf, useEye, gazeNDC, gazeForPatch);
 
   const timeSec = t * 0.001;
 
@@ -1968,7 +2614,7 @@ function tick(t: number) {
 
   // ---- LOW PASS (Simplified: keep THREE.js but simpler) ----
   // Use simple THREE.js scene (already configured for low bitrate)
-  setPass(gazeNDC, LOW_W / LOW_H, FOVEA_R, FEATHER, "low");
+  setPass(gazeForPatch, LOW_W / LOW_H, FOVEA_R, FEATHER, "low");
   if (tLow.supported) tLow.begin();
   rLow.render(scene, camera);
   if (tLow.supported) tLow.end();
@@ -1981,8 +2627,8 @@ function tick(t: number) {
   
   // Calculate ROI position (centered on cursor, scaled to patch canvas)
   // Use gazeNDC converted to patch canvas coordinates (0-1)
-  const patchCursorX = (gazeNDC.x + 1) * 0.5; // Convert NDC (-1..1) to (0..1)
-  const patchCursorY = (-gazeNDC.y + 1) * 0.5; // Flip Y for canvas coordinates
+  const patchCursorX = (gazeForPatch.x + 1) * 0.5; // Convert NDC (-1..1) to (0..1)
+  const patchCursorY = (-gazeForPatch.y + 1) * 0.5; // Flip Y for canvas coordinates
   
   const roiW = ROI_W;
   const roiH = ROI_H;
@@ -2095,10 +2741,53 @@ function tick(t: number) {
     }
     
     ctxPatch.putImageData(imageData, roiXClamped, roiYClamped);
+  } else if (patchMode === 4) {
+    // Mode 4: Reading demo with magnified region around gaze
+    drawReadingDemoPage(readingCtx, timeSec);
+
+    // Base layer: full "document" page, slightly dimmed (periphery).
+    ctxPatch.save();
+    ctxPatch.globalAlpha = 0.62;
+    ctxPatch.drawImage(
+      readingCanvas,
+      0, 0, readingCanvas.width, readingCanvas.height,
+      0, 0, PATCH_W, PATCH_H
+    );
+    ctxPatch.restore();
+
+    // Zoom source around gaze point.
+    const srcW = Math.max(140, Math.floor(roiW * 0.68));
+    const srcH = Math.max(140, Math.floor(roiH * 0.68));
+    const srcX = Math.floor(clamp((patchCursorX * PATCH_W) - srcW / 2, 0, PATCH_W - srcW));
+    const srcY = Math.floor(clamp((patchCursorY * PATCH_H) - srcH / 2, 0, PATCH_H - srcH));
+    const srcXHi = srcX * READING_SUPERSAMPLE;
+    const srcYHi = srcY * READING_SUPERSAMPLE;
+    const srcWHi = srcW * READING_SUPERSAMPLE;
+    const srcHHi = srcH * READING_SUPERSAMPLE;
+
+    ctxPatch.imageSmoothingEnabled = true;
+    ctxPatch.drawImage(
+      readingCanvas,
+      srcXHi, srcYHi, srcWHi, srcHHi,
+      roiXClamped, roiYClamped, roiW, roiH
+    );
+
+    // Visual guide for expected behavior.
+    ctxPatch.strokeStyle = "#ffd166";
+    ctxPatch.lineWidth = 4;
+    ctxPatch.strokeRect(roiXClamped, roiYClamped, roiW, roiH);
+
+    ctxPatch.fillStyle = "rgba(20,20,20,0.75)";
+    ctxPatch.fillRect(roiXClamped + 8, roiYClamped + 8, Math.min(420, roiW - 16), 28);
+    ctxPatch.fillStyle = "#ffe39a";
+    ctxPatch.font = "bold 15px ui-monospace, monospace";
+    ctxPatch.textAlign = "left";
+    ctxPatch.textBaseline = "top";
+    ctxPatch.fillText("Reading demo: lo zoom deve seguire il tuo sguardo", roiXClamped + 14, roiYClamped + 14);
   }
   
   // Debug: Draw ROI border in all modes to make it visible
-  ctxPatch.strokeStyle = patchMode === 0 ? "#333333" : "#00ff00";
+  ctxPatch.strokeStyle = patchMode === 0 ? "#333333" : (patchMode === 4 ? "#ffd166" : "#00ff00");
   ctxPatch.lineWidth = patchMode === 0 ? 1 : 3;
   ctxPatch.strokeRect(roiXClamped, roiYClamped, roiW, roiH);
   
@@ -2108,7 +2797,7 @@ function tick(t: number) {
   ctxPatch.font = "bold 20px ui-monospace, monospace";
   ctxPatch.textAlign = "left";
   ctxPatch.textBaseline = "top";
-  ctxPatch.fillText(`Mode ${patchMode}`, 10, 10);
+  ctxPatch.fillText(`Mode ${patchMode}: ${PATCH_MODE_LABELS[patchMode] ?? "unknown"}`, 10, 10);
   ctxPatch.restore();
   
   const patchGpu = null; // 2D canvas doesn't have GPU timing
@@ -2145,7 +2834,7 @@ function tick(t: number) {
 
   // sender meta @ ~30Hz (binary v2)
   if (loop && loop.dcSend.readyState === "open" && frame % 1 === 0) {
-    const meta = encodeMetaBinary(gazeNDC, patchRectN, useEye ? gf.conf : 0, FOVEA_R, FEATHER);
+    const meta = encodeMetaBinary(gazeForPatch, patchRectN, useEye ? gf.conf : 0, FOVEA_R, FEATHER);
     loop.dcSend.send(meta);
   }
 
@@ -2172,6 +2861,8 @@ function tick(t: number) {
         // gaze
         gaze_x: +gazeNDC.x.toFixed(4),
         gaze_y: +gazeNDC.y.toFixed(4),
+        gaze_filt_x: +gazeForPatch.x.toFixed(4),
+        gaze_filt_y: +gazeForPatch.y.toFixed(4),
         use_eye: !!useEye,
         conf: +(useEye ? gf.conf : 0).toFixed(3),
 
@@ -2259,13 +2950,16 @@ loss worst:  ${TEL.lossPct != null ? TEL.lossPct.toFixed(2) : "…"}%
 rtt:         ${BW.rttMs ?? "…"} ms
 ice aob:     ${TEL.aobKbps ?? "…"} kbps  ice_rtt: ${TEL.iceRttMs ?? "…"} ms
 tele:       ${TEL.enabled ? "ON" : "OFF"}  lines=${TEL.lines.length}
-keys:       B toggle | 1 mobile | 2 balanced | 3 lan | [ ] adjust cap | T tele | D download | X clear | M workload mode
-workload:   patch mode=${patchMode} (0=dark 1=text 2=checker 3=noise) ROI=${Math.min(ROI_W, PATCH_W)}x${Math.min(ROI_H, PATCH_H)}
+keys:       B toggle | 1 mobile | 2 balanced | 3 lan | [ ] adjust cap | T tele | D download | X clear | M workload | C auto | Shift+C calib-only | R analysis | A auto-calib+analysis
+workload:   patch mode=${patchMode} (${PATCH_MODE_LABELS[patchMode] ?? "unknown"}) ROI=${Math.min(ROI_W, PATCH_W)}x${Math.min(ROI_H, PATCH_H)}
 eye conf:   ${gf.conf.toFixed(2)} ${gf.hasIris ? "iris" : "head"}
 
 🎯 TEST MARKERS: Guarda le 4 sfere colorate (🔴🟢🔵🟡) agli angoli.
    Se il tracking funziona, la sfera DEVE apparire nel PATCH (destra)!
-gazeNDC:    ${gazeNDC.x.toFixed(3)}, ${gazeNDC.y.toFixed(3)}`;
+gaze raw:   ${gf.rawX.toFixed(3)}, ${gf.rawY.toFixed(3)}
+gaze eye:   ${gf.gazeX.toFixed(3)}, ${gf.gazeY.toFixed(3)}
+gaze ctrl:  ${gazeNDC.x.toFixed(3)}, ${gazeNDC.y.toFixed(3)}
+gaze filt:  ${gazeForPatch.x.toFixed(3)}, ${gazeForPatch.y.toFixed(3)}`;
     } catch (err) {
       console.error("Error updating sender stats:", err);
       senderStats.textContent = `Error: ${err}`;
