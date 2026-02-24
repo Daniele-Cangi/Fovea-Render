@@ -1,6 +1,34 @@
 import * as THREE from "three";
 import { createLoopback } from "./loopback";
-import { MediapipeGazeProvider, type GazeSample } from "@fovea-render/gaze-mediapipe";
+import { MediapipeGazeProvider } from "@fovea-render/gaze-mediapipe";
+import {
+  CALIB_AUTO_MAX_ATTEMPTS,
+  CALIB_RMSE_ACCEPT_MAX,
+  CALIB_STORAGE_KEY,
+  CALIB_STRICT_REFINEMENT_ATTEMPTS,
+  loadCalibrationStatsFromStorage,
+  type CalibrationRunResult,
+  type CalibrationStats
+} from "./calibrationStorage";
+import { createCalibrationRunner } from "./calibrationFlow";
+import {
+  BW_PROFILES,
+  bwClamp,
+  createBandwidthState,
+  type BwProfileName
+} from "./bandwidthState";
+import { startBitratePoller } from "./bandwidthPoller";
+import { createReceiverComposite } from "./receiverComposite";
+import { drawReadingDemoPage } from "./readingDemo";
+import {
+  buildReadingAnalysisSummary,
+  hideReadingAnalysisStatus,
+  setReadingAnalysisStatus,
+  type GazeFilterMode,
+  type ReadingAnalysisOverlayState,
+  type ReadingAnalysisSample,
+  type ReadingAnalysisStopReason
+} from "./readingAnalysis";
 
 class GpuTimer {
   private gl: WebGL2RenderingContext | null;
@@ -42,6 +70,18 @@ class GpuTimer {
 
 // ---------- CONFIG (enterprise-ish defaults) ----------
 const FPS = 30;
+const FINAL_SINGLE_DEMO = true;
+const FINAL_PATCH_MODE = 4;
+const FINAL_LENS_MIN_RADIUS_PX = 102;
+const FINAL_LENS_MAX_RADIUS_PX = 146;
+const FINAL_LENS_MAX_SPEED = 4200;
+const FINAL_LENS_MAX_ACCEL = 42000;
+const FINAL_LENS_OMEGA_FIX = 18.0;
+const FINAL_LENS_OMEGA_SAC = 31.0;
+const FINAL_LENS_OMEGA_FALLBACK = 14.5;
+const FINAL_LENS_LEAD_FIX_SEC = 0.020;
+const FINAL_LENS_LEAD_SAC_SEC = 0.042;
+const FINAL_LENS_LEAD_FALLBACK_SEC = 0.012;
 
 // fixed "product" render size (stable streams)
 const FULL_W = 1280;
@@ -162,104 +202,10 @@ function telClear() {
   TEL.seq = 0;
 }
 
-type CalibrationStats = {
-  rmse: number;
-  maxErr: number;
-  leftRmse: number | null;
-  rightRmse: number | null;
-  points: number;
-  tier?: "strict" | "provisional";
+const ANALYSIS_OVERLAY: ReadingAnalysisOverlayState = {
+  overlay: null,
+  statusEl: null
 };
-
-type CalibrationRunResult = {
-  ok: boolean;
-  aborted: boolean;
-  qualityRejected: boolean;
-  stats: CalibrationStats | null;
-  appliedStats: CalibrationStats | null;
-};
-
-type GazeFilterMode = "fallback" | "fixation" | "saccade";
-
-const CALIB_STORAGE_KEY = "fovea.calib.v2";
-const CALIB_STATS_STORAGE_KEY = "fovea.calib.stats.v1";
-const CALIB_RMSE_ACCEPT_MAX = 0.33;
-const CALIB_RMSE_PROVISIONAL_MAX = 0.52;
-const CALIB_AUTO_MAX_ATTEMPTS = 3;
-const CALIB_STRICT_REFINEMENT_ATTEMPTS = 1;
-const CALIB_SIDE_RATIO_MAX = 1.55;
-const CALIB_SIDE_RMSE_MAX = 0.42;
-const CALIB_SIDE_RATIO_PROVISIONAL_MAX = 1.85;
-const CALIB_SIDE_RMSE_PROVISIONAL_MAX = 0.58;
-const CALIB_MAXERR_PROVISIONAL_MAX = 1.10;
-
-function isFiniteNum(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v);
-}
-
-function normalizeCalibrationStats(raw: unknown): CalibrationStats | null {
-  if (!raw || typeof raw !== "object") return null;
-  const r = raw as Record<string, unknown>;
-  const rmse = r.rmse;
-  const maxErr = r.maxErr;
-  const points = r.points;
-  if (!isFiniteNum(rmse) || !isFiniteNum(maxErr) || !isFiniteNum(points)) return null;
-  const leftRmse = isFiniteNum(r.leftRmse) ? r.leftRmse : null;
-  const rightRmse = isFiniteNum(r.rightRmse) ? r.rightRmse : null;
-  const tierRaw = r.tier;
-  const tier = tierRaw === "strict" || tierRaw === "provisional" ? tierRaw : undefined;
-  return {
-    rmse,
-    maxErr,
-    leftRmse,
-    rightRmse,
-    points: Math.max(0, Math.round(points)),
-    tier
-  };
-}
-
-function loadCalibrationStatsFromStorage(): CalibrationStats | null {
-  try {
-    const raw = localStorage.getItem(CALIB_STATS_STORAGE_KEY);
-    if (!raw) return null;
-    return normalizeCalibrationStats(JSON.parse(raw));
-  } catch {
-    return null;
-  }
-}
-
-function saveCalibrationStatsToStorage(stats: CalibrationStats | null) {
-  try {
-    if (!stats) {
-      localStorage.removeItem(CALIB_STATS_STORAGE_KEY);
-      return;
-    }
-    localStorage.setItem(CALIB_STATS_STORAGE_KEY, JSON.stringify(stats));
-  } catch {
-    // Ignore storage failures.
-  }
-}
-
-type ReadingAnalysisSample = {
-  t_ms: number;
-  use_eye: boolean;
-  conf: number;
-  raw_x: number;
-  raw_y: number;
-  eye_x: number;
-  eye_y: number;
-  ctrl_x: number;
-  ctrl_y: number;
-  filt_x: number;
-  filt_y: number;
-  est_x: number;
-  est_y: number;
-  filter_mode: GazeFilterMode;
-  patch_cx: number;
-  patch_cy: number;
-};
-
-type ReadingAnalysisStopReason = "manual" | "timeout" | "aborted";
 
 const ANALYSIS = {
   running: false,
@@ -267,71 +213,22 @@ const ANALYSIS = {
   autoPipeline: false,
   startedAtMs: 0,
   stopAtMs: 0,
-  overlay: null as HTMLDivElement | null,
-  statusEl: null as HTMLDivElement | null,
   samples: [] as ReadingAnalysisSample[],
   calibration: null as CalibrationStats | null,
   calibrationAttempted: null as CalibrationStats | null,
   lastSummary: null as Record<string, unknown> | null
 };
 
+function setAnalysisStatus(msg: string, visible = true) {
+  setReadingAnalysisStatus(ANALYSIS_OVERLAY, msg, visible);
+}
+
+function hideAnalysisStatus(delayMs = 0) {
+  hideReadingAnalysisStatus(ANALYSIS_OVERLAY, ANALYSIS.running, delayMs);
+}
+
 // ------------------- BANDWIDTH GOVERNOR -------------------
-type BwProfileName = "mobile" | "balanced" | "lan";
-
-const BW_PROFILES: Record<BwProfileName, {
-  totalKbps: number;
-  minTotalKbps: number;
-  maxTotalKbps: number;
-  splitLow: number;        // portion for LOW
-  floorLowKbps: number;
-  floorPatchKbps: number;
-}> = {
-  mobile:   { totalKbps: 1200, minTotalKbps: 700,  maxTotalKbps: 2500, splitLow: 0.70, floorLowKbps: 350, floorPatchKbps: 150 },
-  balanced: { totalKbps: 3000, minTotalKbps: 1200, maxTotalKbps: 6000, splitLow: 0.67, floorLowKbps: 500, floorPatchKbps: 200 },
-  lan:      { totalKbps: 8000, minTotalKbps: 3000, maxTotalKbps: 12000, splitLow: 0.62, floorLowKbps: 1000, floorPatchKbps: 500 }
-};
-
-const BW = {
-  enabled: true,
-  profile: "balanced" as BwProfileName,
-
-  totalCapKbps: BW_PROFILES.balanced.totalKbps,
-
-  // computed + applied
-  targetLowKbps: 0,
-  targetPatchKbps: 0,
-  appliedLowKbps: 0,
-  appliedPatchKbps: 0,
-  lastTargetLowKbps: 0,  // track previous target to detect changes
-  lastTargetPatchKbps: 0,  // track previous target to detect changes
-  lastApplyAttemptMs: 0,  // throttle to avoid spam on failures
-
-  // stability timers
-  stableBadMs: 0,
-  stableGoodMs: 0,
-  lastAdjustMs: 0,
-
-  // last measured quality
-  rttMs: null as number | null,
-  lossPct: null as number | null,
-  aobKbps: null as number | null,
-  iceRttMs: null as number | null,
-
-  // budget allocator
-  alloc: {
-    enabled: true,
-    biasKbps: 0,  // positive means extra budget moved to PATCH from LOW
-    lowUnderMs: 0,
-    lowWellMs: 0,  // timer for LOW well utilized condition
-    lowHighDemandMs: 0,  // timer for fast-release: LOW high demand
-    patchHungryMs: 0,
-    patchUnderMs: 0,  // separate timer for PATCH underutilized condition
-    eyeWeakMs: 0,  // timer for fast-release: eye-tracking weak
-    cooldownMs: 0
-  }
-};
-
-function bwClamp(v: number, a: number, b: number) { return Math.max(a, Math.min(b, v)); }
+const BW = createBandwidthState("balanced");
 
 function bwSetProfile(name: BwProfileName) {
   BW.profile = name;
@@ -348,63 +245,19 @@ function bwSetProfile(name: BwProfileName) {
   });
 }
 
-// Apply bitrate caps (bps) to sender (encoding[0])
-async function applyMaxBitrateKbps(sender: RTCRtpSender, kbps: number): Promise<{ ok: boolean; err?: string; readbackBps?: number | null }> {
-  try {
-    const params = sender.getParameters();
-    if (!params.encodings || params.encodings.length === 0) params.encodings = [{} as any];
-    const bps = Math.max(1000, Math.round(kbps * 1000));
-    params.encodings[0].maxBitrate = bps;
-
-    await sender.setParameters(params);
-
-    // readback verification
-    const rb = sender.getParameters();
-    const rbBps = rb.encodings && rb.encodings[0] && typeof rb.encodings[0].maxBitrate === "number"
-      ? rb.encodings[0].maxBitrate
-      : null;
-
-    return { ok: true, readbackBps: rbBps };
-  } catch (e: any) {
-    return { ok: false, err: String(e?.name || e) + (e?.message ? (": " + e.message) : "") };
-  }
-}
-
-function computeCaps(totalKbps: number) {
-  const p = BW_PROFILES[BW.profile];
-  totalKbps = bwClamp(totalKbps, p.minTotalKbps, p.maxTotalKbps);
-
-  // PATCH-first throttling: LOW gets priority continuity
-  let low = Math.round(totalKbps * p.splitLow);
-  let patch = totalKbps - low;
-
-  // floors
-  if (low < p.floorLowKbps) low = p.floorLowKbps;
-  patch = totalKbps - low;
-
-  if (patch < p.floorPatchKbps) {
-    patch = p.floorPatchKbps;
-    low = totalKbps - patch;
-  }
-
-  // if impossible to satisfy both floors (very low total), clamp patch to >=0
-  if (low < p.floorLowKbps) {
-    low = p.floorLowKbps;
-    patch = Math.max(0, totalKbps - low);
-  }
-
-  return { totalKbps, lowKbps: Math.max(0, low), patchKbps: Math.max(0, patch) };
-}
-
 window.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
+  if (k === "f") void toggleFullscreenStage();
+  if (k === "h") toggleHudVisibility();
   if (k === "g") GOV.enabled = !GOV.enabled;
   if (k === "=" || k === "+") GOV.targetGpuMs = clamp(GOV.targetGpuMs + 0.5, 4, 20);
   if (k === "-" || k === "_") GOV.targetGpuMs = clamp(GOV.targetGpuMs - 0.5, 4, 20);
   if (k === "l") LOD_ON = !LOD_ON;
   if (k === "m") {
-    patchMode = (patchMode + 1) % PATCH_MODE_COUNT;
-    telEvent("workload_mode", { patchMode });
+    if (!FINAL_SINGLE_DEMO) {
+      patchMode = (patchMode + 1) % PATCH_MODE_COUNT;
+      telEvent("workload_mode", { patchMode });
+    }
   }
   if (k === "c") {
     if (e.shiftKey) void calibrate3x3();
@@ -429,734 +282,32 @@ window.addEventListener("keydown", (e) => {
   if (k === "]") BW.totalCapKbps = bwClamp(BW.totalCapKbps + 200, BW_PROFILES[BW.profile].minTotalKbps, BW_PROFILES[BW.profile].maxTotalKbps);
 });
 
-// ------------------- WEBRTC BITRATE (2Hz) -------------------
-type SenderBitrateState = {
-  lastBytesSent: number;
-  lastRtxBytesSent: number;
-  lastTs: number;
-  kbpsWire: number | null;
-  kbpsPayload: number | null;
-};
-
-type OutboundKbpsResult = {
-  wire: number | null;
-  payload: number | null;
-};
-
-async function readOutboundKbps(sender: RTCRtpSender, st: SenderBitrateState): Promise<OutboundKbpsResult> {
-  const report = await sender.getStats();
-  let best: any = null;
-
-  report.forEach((r: any) => {
-    if (r.type === "outbound-rtp" && r.kind === "video" && !r.isRemote) {
-      // Chrome sometimes gives multiple; pick the one with bytesSent
-      if (typeof r.bytesSent === "number") best = r;
-    }
-  });
-
-  if (!best) {
-    return { wire: st.kbpsWire, payload: st.kbpsPayload };
-  }
-
-  const bytesSent = best.bytesSent as number;
-  const rtxBytesSent = (typeof best.retransmittedBytesSent === "number") ? best.retransmittedBytesSent : 0;
-  const ts = best.timestamp as number; // ms
-
-  if (st.lastTs === 0) {
-    st.lastBytesSent = bytesSent;
-    st.lastRtxBytesSent = rtxBytesSent;
-    st.lastTs = ts;
-    st.kbpsWire = 0;
-    st.kbpsPayload = 0;
-    return { wire: 0, payload: 0 };
-  }
-
-  const dt = (ts - st.lastTs) / 1000;
-  if (dt <= 0) {
-    return { wire: st.kbpsWire, payload: st.kbpsPayload };
-  }
-
-  // Wire bytes delta (includes RTX)
-  const dWireBytes = bytesSent - st.lastBytesSent;
-  if (dWireBytes < 0) {
-    // counter reset
-    st.lastBytesSent = bytesSent;
-    st.lastRtxBytesSent = rtxBytesSent;
-    st.lastTs = ts;
-    return { wire: st.kbpsWire, payload: st.kbpsPayload };
-  }
-
-  // Payload bytes delta (excludes RTX)
-  const lastPayloadBytes = st.lastBytesSent - st.lastRtxBytesSent;
-  const currentPayloadBytes = bytesSent - rtxBytesSent;
-  const dPayloadBytes = Math.max(0, currentPayloadBytes - lastPayloadBytes); // clamp >= 0
-
-  st.lastBytesSent = bytesSent;
-  st.lastRtxBytesSent = rtxBytesSent;
-  st.lastTs = ts;
-
-  const kbpsWire = (dWireBytes * 8) / (dt * 1000);
-  const kbpsPayload = (dPayloadBytes * 8) / (dt * 1000);
-
-  st.kbpsWire = kbpsWire;
-  st.kbpsPayload = kbpsPayload;
-
-  return { wire: kbpsWire, payload: kbpsPayload };
-}
-
-type RemoteQualityState = {
-  lastLost: number;
-  lastRecv: number;
-  lastTs: number;
-  rttMs: number | null;
-  lossPct: number | null;
-};
-
-async function readRemoteQuality(sender: RTCRtpSender, st: RemoteQualityState) {
-  const report = await sender.getStats();
-
-  let rttMs: number | null = null;
-  let lost: number | null = null;
-  let recv: number | null = null;
-  let ts: number | null = null;
-
-  report.forEach((r: any) => {
-    if (r.type === "remote-inbound-rtp" && r.kind === "video") {
-      // roundTripTime is usually seconds (spec), convert to ms
-      if (typeof r.roundTripTime === "number") rttMs = Math.round(r.roundTripTime * 1000);
-      if (typeof r.packetsLost === "number") lost = r.packetsLost;
-      if (typeof r.packetsReceived === "number") recv = r.packetsReceived;
-      if (typeof r.timestamp === "number") ts = r.timestamp;
-    }
-  });
-
-  // update RTT (smoothed lightly)
-  if (rttMs != null) st.rttMs = st.rttMs == null ? rttMs : Math.round(0.7 * st.rttMs + 0.3 * rttMs);
-
-  // compute loss% from deltas if possible
-  if (lost != null && recv != null && ts != null) {
-    if (st.lastTs === 0) {
-      st.lastLost = lost; st.lastRecv = recv; st.lastTs = ts;
-    } else {
-      const dLost = lost - st.lastLost;
-      const dRecv = recv - st.lastRecv;
-      st.lastLost = lost; st.lastRecv = recv; st.lastTs = ts;
-
-      const denom = dLost + dRecv;
-      if (denom > 50) { // avoid noise
-        const pct = (dLost / denom) * 100;
-        st.lossPct = st.lossPct == null ? pct : (0.75 * st.lossPct + 0.25 * pct);
-      }
-    }
-  }
-
-  return { rttMs: st.rttMs, lossPct: st.lossPct };
-}
-
-type RxStreamLoss = {
-  lastLost: number;
-  lastRecv: number;
-  lastTs: number;
-  lossPct: number | null;
-};
-
-type RxLossState = Map<string, RxStreamLoss>;  // key by ssrc or id
-
-async function readReceiverLossWorst(pcRecv: RTCPeerConnection, st: RxLossState): Promise<number | null> {
-  try {
-    const report = await pcRecv.getStats();
-    let worst: number | null = null;
-
-    report.forEach((r: any) => {
-      if (r.type === "inbound-rtp" && r.kind === "video" && !r.isRemote) {
-        const ssrc = (typeof r.ssrc === "number") ? String(r.ssrc) : (r.id || "unknown");
-        const lost = (typeof r.packetsLost === "number") ? r.packetsLost : null;
-        const recv = (typeof r.packetsReceived === "number") ? r.packetsReceived : null;
-        const ts = (typeof r.timestamp === "number") ? r.timestamp : null;
-        if (lost == null || recv == null || ts == null) return;
-
-        let entry = st.get(ssrc);
-        if (!entry) {
-          entry = { lastLost: 0, lastRecv: 0, lastTs: 0, lossPct: null };
-          st.set(ssrc, entry);
-        }
-
-        if (entry.lastTs === 0) {
-          entry.lastLost = lost;
-          entry.lastRecv = recv;
-          entry.lastTs = ts;
-          entry.lossPct = 0;
-        } else {
-          const dLost = lost - entry.lastLost;
-          const dRecv = recv - entry.lastRecv;
-          entry.lastLost = lost;
-          entry.lastRecv = recv;
-          entry.lastTs = ts;
-
-          const denom = dLost + dRecv;
-          if (denom > 50 && dLost >= 0 && dRecv >= 0) {
-            const pct = (dLost / denom) * 100;
-            entry.lossPct = entry.lossPct == null ? pct : (0.75 * entry.lossPct + 0.25 * pct);
-          }
-        }
-
-        if (entry.lossPct != null) {
-          worst = (worst == null) ? entry.lossPct : Math.max(worst, entry.lossPct);
-        }
-      }
-    });
-
-    return worst == null ? null : +worst.toFixed(3);
-  } catch {
-    return null;
-  }
-}
-
-async function readIceBudget(pc: RTCPeerConnection) {
-  try {
-    const stats = await pc.getStats();
-
-    let selectedId: string | null = null;
-    stats.forEach((r: any) => {
-      if (r.type === "transport" && typeof r.selectedCandidatePairId === "string") {
-        selectedId = r.selectedCandidatePairId;
-      }
-    });
-
-    let pair: any = null;
-
-    // If we have selectedId, try direct get (Map-like)
-    if (selectedId && (stats as any).get) {
-      pair = (stats as any).get(selectedId);
-    }
-
-    // Fallback: find nominated/selected succeeded pair
-    if (!pair) {
-      stats.forEach((r: any) => {
-        if (r.type === "candidate-pair" && r.state === "succeeded") {
-          if (r.nominated === true || r.selected === true) pair = r;
-        }
-      });
-    }
-
-    if (!pair) return { aobKbps: null as number | null, iceRttMs: null as number | null };
-
-    const aobBps = (typeof pair.availableOutgoingBitrate === "number") ? pair.availableOutgoingBitrate : null;
-    const rttSec = (typeof pair.currentRoundTripTime === "number") ? pair.currentRoundTripTime : null;
-
-    return {
-      aobKbps: aobBps == null ? null : Math.round(aobBps / 1000),
-      iceRttMs: rttSec == null ? null : Math.round(rttSec * 1000)
-    };
-  } catch {
-    return { aobKbps: null as number | null, iceRttMs: null as number | null };
-  }
-}
-
-function startBitratePoller(opts: {
-  lowSender: RTCRtpSender;
-  patchSender: RTCRtpSender;
-  pcSend?: RTCPeerConnection;
-  pcRecv?: RTCPeerConnection;
-  intervalMs?: number;
-}) {
-  const intervalMs = opts.intervalMs ?? 500; // 2Hz
-
-  const stLow: SenderBitrateState = {
-    lastBytesSent: 0,
-    lastRtxBytesSent: 0,
-    lastTs: 0,
-    kbpsWire: null,
-    kbpsPayload: null
-  };
-  const stPatch: SenderBitrateState = {
-    lastBytesSent: 0,
-    lastRtxBytesSent: 0,
-    lastTs: 0,
-    kbpsWire: null,
-    kbpsPayload: null
-  };
-
-  const qLow: RemoteQualityState = { lastLost: 0, lastRecv: 0, lastTs: 0, rttMs: null, lossPct: null };
-  const qPatch: RemoteQualityState = { lastLost: 0, lastRecv: 0, lastTs: 0, rttMs: null, lossPct: null };
-
-  const rxState: RxLossState = new Map();
-
-  let lossRxSeen = false;
-  
-  // EMA state for kbps smoothing (alpha ~0.2 for 500ms tick = ~2-3s time constant)
-  let kbpsLowEma: number | null = null;
-  let kbpsPatchEma: number | null = null;
-  const kbpsAlpha = 0.2;
-
-  let running = true;
-  let inFlight = false;
-
-  const id = window.setInterval(async () => {
-    if (!running || inFlight) return;
-    inFlight = true;
-
-    try {
-      const [kLow, kPatch] = await Promise.all([
-        readOutboundKbps(opts.lowSender, stLow),
-        readOutboundKbps(opts.patchSender, stPatch)
-      ]);
-
-      // Wire (includes RTX)
-      TEL.kbpsLowWire = kLow.wire;
-      TEL.kbpsPatchWire = kPatch.wire;
-
-      // Payload (excludes RTX) - this is the "clean" metric
-      TEL.kbpsLowPayload = kLow.payload;
-      TEL.kbpsPatchPayload = kPatch.payload;
-
-      // Backward compatibility: set kbps_low/kbps_patch to payload
-      TEL.kbpsLow = kLow.payload;
-      TEL.kbpsPatch = kPatch.payload;
-      
-      // Update EMA for smoothed display (using payload, not wire)
-      if (kLow.payload != null) {
-        kbpsLowEma = kbpsLowEma == null ? kLow.payload : kbpsLowEma + kbpsAlpha * (kLow.payload - kbpsLowEma);
-        TEL.kbpsLowEma = kbpsLowEma;
-      }
-      if (kPatch.payload != null) {
-        kbpsPatchEma = kbpsPatchEma == null ? kPatch.payload : kbpsPatchEma + kbpsAlpha * (kPatch.payload - kbpsPatchEma);
-        TEL.kbpsPatchEma = kbpsPatchEma;
-      }
-
-      // quality (RTT/loss) from remote-inbound-rtp (take worst case)
-      const [qqL, qqP] = await Promise.all([
-        readRemoteQuality(opts.lowSender, qLow),
-        readRemoteQuality(opts.patchSender, qPatch)
-      ]);
-
-      const rtt = Math.max(qqL.rttMs ?? 0, qqP.rttMs ?? 0) || null;
-      const lossTx = Math.max(qqL.lossPct ?? 0, qqP.lossPct ?? 0) || null;
-
-      // RX loss from receiver (most reliable) - per-stream worst-case
-      let lossRx: number | null = null;
-      if (opts.pcRecv) {
-        lossRx = await readReceiverLossWorst(opts.pcRecv, rxState);
-      }
-      TEL.lossRxPct = lossRx;
-      TEL.lossTxPct = lossTx;
-
-      // Calculate worst-case loss
-      const lossWorst =
-        (lossTx == null && lossRx == null) ? null :
-        Math.max(lossTx ?? 0, lossRx ?? 0);
-
-      BW.rttMs = rtt;
-      BW.lossPct = lossWorst;
-
-      TEL.rttMs = rtt;
-      TEL.lossPct = lossWorst;
-
-      // Event marker quando lossRx diventa attivo
-      if (!lossRxSeen && lossRx != null) {
-        lossRxSeen = true;
-        telEvent("loss_rx_active", { loss_rx_pct: lossRx });
-      }
-
-      // Read ICE budget (if available)
-      let aobKbps: number | null = null;
-      let iceRttMs: number | null = null;
-
-      if (opts.pcSend) {
-        const b = await readIceBudget(opts.pcSend);
-        aobKbps = b.aobKbps;
-        iceRttMs = b.iceRttMs;
-      }
-
-      BW.aobKbps = aobKbps;
-      BW.iceRttMs = iceRttMs;
-
-      TEL.aobKbps = aobKbps;
-      TEL.iceRttMs = iceRttMs;
-
-      // --- bandwidth governor ---
-      const now = performance.now();
-      const p = BW_PROFILES[BW.profile];
-
-      TEL.bwProfile = BW.profile;
-      TEL.bwEnabled = BW.enabled;
-
-      // Hard clamp to transport budget (keep some headroom)
-      if (BW.enabled && aobKbps != null && aobKbps > 0) {
-        const hardCap = bwClamp(Math.round(aobKbps * 0.88), p.minTotalKbps, p.maxTotalKbps);
-
-        // clamp only if meaningfully lower (avoid spam)
-        if (hardCap < BW.totalCapKbps && (BW.totalCapKbps - hardCap) >= Math.max(150, BW.totalCapKbps * 0.10)) {
-          const from = BW.totalCapKbps;
-          BW.totalCapKbps = hardCap;
-          telEvent("bw_budget_clamp", {
-            from_kbps: from,
-            to_kbps: hardCap,
-            applied_low_kbps: BW.appliedLowKbps,
-            applied_patch_kbps: BW.appliedPatchKbps,
-            aob_kbps: aobKbps,
-            ice_rtt_ms: iceRttMs
-          });
-        }
-      }
-
-      if (BW.enabled && (rtt != null || lossWorst != null)) {
-        const bad = (lossWorst != null && lossWorst > 2.0) || (rtt != null && rtt > 180);
-        const good = (lossWorst != null && lossWorst < 0.5) && (rtt != null && rtt < 120);
-
-        if (bad) { BW.stableBadMs += intervalMs; BW.stableGoodMs = 0; }
-        else if (good) { BW.stableGoodMs += intervalMs; BW.stableBadMs = 0; }
-        else { BW.stableGoodMs = 0; BW.stableBadMs = 0; }
-
-        const cooldownMs = 1500;
-
-        if (BW.stableBadMs >= 2000 && (now - BW.lastAdjustMs) >= cooldownMs) {
-          const from = BW.totalCapKbps;
-          BW.totalCapKbps = bwClamp(Math.round(BW.totalCapKbps * 0.85), p.minTotalKbps, p.maxTotalKbps);
-          BW.lastAdjustMs = now;
-          BW.stableBadMs = 0;
-          telEvent("bw_down", {
-            from_kbps: from,
-            to_kbps: BW.totalCapKbps,
-            applied_low_kbps: BW.appliedLowKbps,
-            applied_patch_kbps: BW.appliedPatchKbps,
-            rtt_ms: rtt,
-            loss_tx_pct: lossTx,
-            loss_rx_pct: lossRx,
-            loss_pct: lossWorst,
-            aob_kbps: aobKbps,
-            ice_rtt_ms: iceRttMs
-          });
-        }
-
-        if (BW.stableGoodMs >= 5000 && (now - BW.lastAdjustMs) >= cooldownMs) {
-          const from = BW.totalCapKbps;
-          BW.totalCapKbps = bwClamp(Math.round(BW.totalCapKbps * 1.05), p.minTotalKbps, p.maxTotalKbps);
-          BW.lastAdjustMs = now;
-          BW.stableGoodMs = 0;
-          telEvent("bw_up", {
-            from_kbps: from,
-            to_kbps: BW.totalCapKbps,
-            applied_low_kbps: BW.appliedLowKbps,
-            applied_patch_kbps: BW.appliedPatchKbps,
-            rtt_ms: rtt,
-            loss_tx_pct: lossTx,
-            loss_rx_pct: lossRx,
-            loss_pct: lossWorst,
-            aob_kbps: aobKbps,
-            ice_rtt_ms: iceRttMs
-          });
-        }
-      }
-
-      const caps = computeCaps(BW.totalCapKbps);
-      BW.totalCapKbps = caps.totalKbps;
-
-      // ---------- BUDGET ALLOCATOR ----------
-      // Reallocate budget from LOW to PATCH based on utilization
-      let finalLowKbps = caps.lowKbps;
-      let finalPatchKbps = caps.patchKbps;
-
-      if (BW.enabled && BW.alloc.enabled && 
-          (lossWorst == null || lossWorst < 1.0) && 
-          (rtt == null || rtt < 160)) {
-        
-        const p = BW_PROFILES[BW.profile];
-        
-        // Calculate utilization (use applied if available, otherwise target)
-        const appliedLow = BW.appliedLowKbps || caps.lowKbps;
-        const appliedPatch = BW.appliedPatchKbps || caps.patchKbps;
-        const utilLow = (TEL.kbpsLowEma != null && appliedLow > 0) ? TEL.kbpsLowEma / appliedLow : null;
-        const utilPatch = (TEL.kbpsPatchEma != null && appliedPatch > 0) ? TEL.kbpsPatchEma / appliedPatch : null;
-
-        TEL.utilLow = utilLow;
-        TEL.utilPatch = utilPatch;
-
-        // Define hunger signal: PATCH is hungry if utilPatch > 0.70 for >= 2000ms
-        const hungryPatch = (utilPatch != null && utilPatch > 0.70);
-        TEL.hungryPatch = hungryPatch;
-
-        // Update timers based on conditions
-        BW.alloc.cooldownMs = Math.max(0, BW.alloc.cooldownMs - intervalMs);
-
-        // Increment lowUnderMs if LOW is underutilized
-        if (utilLow != null && utilLow < 0.35) {
-          BW.alloc.lowUnderMs += intervalMs;
-        } else {
-          BW.alloc.lowUnderMs = 0;
-        }
-
-        // Increment lowWellMs if LOW is well utilized
-        if (utilLow != null && utilLow > 0.75) {
-          BW.alloc.lowWellMs += intervalMs;
-        } else {
-          BW.alloc.lowWellMs = 0;
-        }
-
-        // Increment lowHighDemandMs for fast-release: LOW high demand
-        if (utilLow != null && utilLow > 0.60) {
-          BW.alloc.lowHighDemandMs += intervalMs;
-        } else {
-          BW.alloc.lowHighDemandMs = 0;
-        }
-
-        // Increment patchHungryMs if PATCH is hungry (utilPatch > 0.70)
-        if (hungryPatch) {
-          BW.alloc.patchHungryMs += intervalMs;
-        } else {
-          BW.alloc.patchHungryMs = 0;
-        }
-
-        // Increment patchUnderMs if PATCH is underutilized
-        if (utilPatch != null && utilPatch < 0.50) {
-          BW.alloc.patchUnderMs += intervalMs;
-        } else {
-          BW.alloc.patchUnderMs = 0;
-        }
-
-        // Increment eyeWeakMs for fast-release: eye-tracking weak
-        const useEye = TEL.useEye === true;
-        const gazeConf = TEL.gazeConf ?? 0;
-        if (!useEye || gazeConf < 0.45) {
-          BW.alloc.eyeWeakMs += intervalMs;
-        } else {
-          BW.alloc.eyeWeakMs = 0;
-        }
-
-        // Adjust bias if conditions met and cooldown expired
-        if (BW.alloc.cooldownMs === 0) {
-          let biasChanged = false;
-          let biasBlocked = false;
-          const oldBias = BW.alloc.biasKbps;
-          const maxBias = Math.max(0, caps.lowKbps - p.floorLowKbps);
-          // Safety: keep LOW at least 25% of total cap
-          const minLowKbps = caps.totalKbps * 0.25;
-          const safeMaxBias = Math.max(0, caps.lowKbps - Math.max(p.floorLowKbps, minLowKbps));
-          const effectiveMaxBias = Math.min(maxBias, safeMaxBias);
-
-          // FAST RELEASE: HIGH PRIORITY
-          // If LOW demand suddenly rises, release bias quickly
-          if (BW.alloc.lowHighDemandMs >= 500) {
-            BW.alloc.biasKbps = Math.max(0, BW.alloc.biasKbps - 400);
-            BW.alloc.cooldownMs = 1500;
-            biasChanged = true;
-          }
-          // If eye-tracking is weak, PATCH is less valuable
-          else if (BW.alloc.eyeWeakMs >= 1000) {
-            BW.alloc.biasKbps = Math.max(0, BW.alloc.biasKbps - 200);
-            BW.alloc.cooldownMs = 1500;
-            biasChanged = true;
-          }
-          // INCREASE bias: ONLY if LOW underutilized AND PATCH hungry
-          else if (BW.alloc.lowUnderMs >= 3000 && BW.alloc.patchHungryMs >= 2000) {
-            BW.alloc.biasKbps = Math.min(effectiveMaxBias, BW.alloc.biasKbps + 200);
-            BW.alloc.cooldownMs = 1500;
-            biasChanged = true;
-          }
-          // BLOCKED: LOW underutilized but PATCH not hungry
-          else if (BW.alloc.lowUnderMs >= 3000 && !hungryPatch) {
-            biasBlocked = true;
-            telEvent("bw_rebalance_blocked", {
-              util_low: utilLow,
-              util_patch: utilPatch,
-              hungry_patch: hungryPatch,
-              bias_kbps: BW.alloc.biasKbps
-            });
-          }
-          // Decrease bias: LOW well utilized OR PATCH underutilized
-          else if (BW.alloc.lowWellMs >= 3000) {
-            // LOW is well utilized for long enough, give budget back
-            BW.alloc.biasKbps = Math.max(0, BW.alloc.biasKbps - 200);
-            BW.alloc.cooldownMs = 1500;
-            biasChanged = true;
-          }
-          else if (BW.alloc.patchUnderMs >= 5000) {
-            // PATCH is underutilized for long enough, give budget back to LOW
-            BW.alloc.biasKbps = Math.max(0, BW.alloc.biasKbps - 200);
-            BW.alloc.cooldownMs = 1500;
-            biasChanged = true;
-          }
-
-          // Clamp bias with safety guard
-          BW.alloc.biasKbps = Math.max(0, Math.min(effectiveMaxBias, BW.alloc.biasKbps));
-
-          // Apply bias to caps
-          finalLowKbps = caps.lowKbps - BW.alloc.biasKbps;
-          finalPatchKbps = caps.patchKbps + BW.alloc.biasKbps;
-
-          // Enforce floors
-          if (finalLowKbps < p.floorLowKbps) {
-            finalLowKbps = p.floorLowKbps;
-            finalPatchKbps = caps.totalKbps - finalLowKbps;
-            BW.alloc.biasKbps = caps.lowKbps - finalLowKbps;  // adjust bias to match
-          }
-          if (finalPatchKbps < p.floorPatchKbps) {
-            finalPatchKbps = p.floorPatchKbps;
-            finalLowKbps = caps.totalKbps - finalPatchKbps;
-            BW.alloc.biasKbps = caps.lowKbps - finalLowKbps;  // adjust bias to match
-          }
-
-          // Emit event if bias changed
-          if (biasChanged && BW.alloc.biasKbps !== oldBias) {
-            telEvent("bw_rebalance", {
-              bias_kbps: BW.alloc.biasKbps,
-              util_low: utilLow,
-              util_patch: utilPatch,
-              base_low: caps.lowKbps,
-              base_patch: caps.patchKbps,
-              new_low: finalLowKbps,
-              new_patch: finalPatchKbps
-            });
-          }
-        } else {
-          // Apply existing bias even during cooldown
-          finalLowKbps = caps.lowKbps - BW.alloc.biasKbps;
-          finalPatchKbps = caps.patchKbps + BW.alloc.biasKbps;
-
-          // Enforce floors
-          if (finalLowKbps < p.floorLowKbps) {
-            finalLowKbps = p.floorLowKbps;
-            finalPatchKbps = caps.totalKbps - finalLowKbps;
-          }
-          if (finalPatchKbps < p.floorPatchKbps) {
-            finalPatchKbps = p.floorPatchKbps;
-            finalLowKbps = caps.totalKbps - finalPatchKbps;
-          }
-        }
-      }
-
-      BW.targetLowKbps = finalLowKbps;
-      BW.targetPatchKbps = finalPatchKbps;
-
-      TEL.targetLowKbps = BW.targetLowKbps;
-      TEL.targetPatchKbps = BW.targetPatchKbps;
-      TEL.allocBiasKbps = BW.alloc.biasKbps;
-
-      // Detect if target caps changed (force apply regardless of threshold)
-      const targetChanged = 
-        (BW.targetLowKbps !== BW.lastTargetLowKbps) || 
-        (BW.targetPatchKbps !== BW.lastTargetPatchKbps);
-
-      // Apply caps IMMEDIATELY in same tick when connection is ready
-      const ready = !opts.pcSend || opts.pcSend.connectionState === "connected" || opts.pcSend.iceConnectionState === "connected";
-      const throttleMs = 200;  // minimal throttle to avoid spam on failures
-      const canApply = (now - BW.lastApplyAttemptMs) >= throttleMs;
-
-      if (BW.enabled && ready && canApply) {
-        // LOW lane: force apply if target changed, otherwise check if applied differs
-        const needsLow = targetChanged || !BW.appliedLowKbps || BW.targetLowKbps !== BW.appliedLowKbps;
-        if (needsLow) {
-          BW.lastApplyAttemptMs = now;
-          const res = await applyMaxBitrateKbps(opts.lowSender, BW.targetLowKbps);
-          if (res.ok) {
-            const expectedBps = Math.round(BW.targetLowKbps * 1000);
-            BW.appliedLowKbps = BW.targetLowKbps;  // Update immediately on success
-            if (res.readbackBps != null && Math.abs(res.readbackBps - expectedBps) > expectedBps * 0.15) {
-              telEvent("bw_apply_mismatch", {
-                lane: "low",
-                target_kbps: BW.targetLowKbps,
-                applied_kbps: BW.appliedLowKbps,
-                readback_bps: res.readbackBps
-              });
-            } else {
-              telEvent("bw_apply_ok", {
-                lane: "low",
-                target_kbps: BW.targetLowKbps,
-                applied_kbps: BW.appliedLowKbps,
-                readback_bps: res.readbackBps ?? null
-              });
-            }
-          } else {
-            telEvent("bw_apply_fail", {
-              lane: "low",
-              target_kbps: BW.targetLowKbps,
-              applied_kbps: BW.appliedLowKbps,
-              err: res.err,
-              pcState: {
-                cs: opts.pcSend?.connectionState,
-                ice: opts.pcSend?.iceConnectionState
-              }
-            });
-            // do not update applied -> retry next tick
-          }
-        }
-
-        // PATCH lane: force apply if target changed, otherwise check if applied differs
-        const needsPatch = targetChanged || !BW.appliedPatchKbps || BW.targetPatchKbps !== BW.appliedPatchKbps;
-        if (needsPatch) {
-          BW.lastApplyAttemptMs = now;
-          const res = await applyMaxBitrateKbps(opts.patchSender, BW.targetPatchKbps);
-          if (res.ok) {
-            const expectedBps = Math.round(BW.targetPatchKbps * 1000);
-            BW.appliedPatchKbps = BW.targetPatchKbps;  // Update immediately on success
-            if (res.readbackBps != null && Math.abs(res.readbackBps - expectedBps) > expectedBps * 0.15) {
-              telEvent("bw_apply_mismatch", {
-                lane: "patch",
-                target_kbps: BW.targetPatchKbps,
-                applied_kbps: BW.appliedPatchKbps,
-                readback_bps: res.readbackBps
-              });
-            } else {
-              telEvent("bw_apply_ok", {
-                lane: "patch",
-                target_kbps: BW.targetPatchKbps,
-                applied_kbps: BW.appliedPatchKbps,
-                readback_bps: res.readbackBps ?? null
-              });
-            }
-          } else {
-            telEvent("bw_apply_fail", {
-              lane: "patch",
-              target_kbps: BW.targetPatchKbps,
-              applied_kbps: BW.appliedPatchKbps,
-              err: res.err,
-              pcState: {
-                cs: opts.pcSend?.connectionState,
-                ice: opts.pcSend?.iceConnectionState
-              }
-            });
-            // do not update applied -> retry next tick
-          }
-        }
-      }
-
-      // Update lastTarget* after application attempt (for next tick comparison)
-      BW.lastTargetLowKbps = BW.targetLowKbps;
-      BW.lastTargetPatchKbps = BW.targetPatchKbps;
-
-      // Update TEL.applied* AFTER application attempt (so telemetry reflects current applied state)
-      TEL.appliedLowKbps = BW.appliedLowKbps;
-      TEL.appliedPatchKbps = BW.appliedPatchKbps;
-
-    } catch {
-      // ignore
-    } finally {
-      inFlight = false;
-    }
-  }, intervalMs);
-
-  const stop = () => {
-    running = false;
-    window.clearInterval(id);
-  };
-
-  window.addEventListener("beforeunload", stop);
-  return { stop };
-}
-
 // ---------- DOM ----------
 const cLow = document.getElementById("cLow") as HTMLCanvasElement;
 const cPatch = document.getElementById("cPatch") as HTMLCanvasElement;
 const cOut = document.getElementById("cOut") as HTMLCanvasElement;
+let finalOutCtx: CanvasRenderingContext2D | null = null;
 
 const senderStats = document.getElementById("senderStats");
 const recvStats = document.getElementById("recvStats");
+
+const appRoot = document.getElementById("appRoot") as HTMLDivElement | null;
+const gazeReticle = document.getElementById("gazeReticle") as HTMLDivElement | null;
+const hudFilterModeEl = document.getElementById("hudFilterMode") as HTMLSpanElement | null;
+const hudConfEl = document.getElementById("hudConf") as HTMLSpanElement | null;
+const hudCalibRmseEl = document.getElementById("hudCalibRmse") as HTMLSpanElement | null;
+const btnFullscreen = document.getElementById("btnFullscreen") as HTMLButtonElement | null;
+const btnHud = document.getElementById("btnHud") as HTMLButtonElement | null;
 
 const vLow = document.getElementById("vLow") as HTMLVideoElement;
 const vPatch = document.getElementById("vPatch") as HTMLVideoElement;
 
 if (!cLow || !cPatch || !cOut || !senderStats || !recvStats || !vLow || !vPatch) {
   throw new Error("Missing required DOM elements");
+}
+if (FINAL_SINGLE_DEMO) finalOutCtx = cOut.getContext("2d", { alpha: false });
+if (FINAL_SINGLE_DEMO && !finalOutCtx) {
+  throw new Error("Failed to get 2D context for final output canvas");
 }
 
 // size canvases
@@ -1170,10 +321,71 @@ console.log("Canvases initialized:", {
   out: { w: FULL_W, h: FULL_H }
 });
 
-// show canvases at friendly size
-cLow.style.width = "420px"; cLow.style.height = "236px";
-cPatch.style.width = "640px"; cPatch.style.height = "640px"; // Larger patch stream for visibility
-cOut.style.width = "640px"; cOut.style.height = "360px"; // Smaller receiver
+let hudHidden = false;
+let lastHudCalibrationReadMs = -1;
+
+function updateFullscreenButtonLabel() {
+  if (!btnFullscreen) return;
+  btnFullscreen.textContent = document.fullscreenElement ? "Exit Fullscreen (F)" : "Go Fullscreen (F)";
+}
+
+async function toggleFullscreenStage() {
+  try {
+    if (!document.fullscreenElement) {
+      const host: Element = appRoot ?? document.documentElement;
+      await host.requestFullscreen();
+    } else {
+      await document.exitFullscreen();
+    }
+  } catch (err) {
+    console.warn("Fullscreen toggle failed:", err);
+  }
+}
+
+function setHudVisibility(hidden: boolean) {
+  hudHidden = hidden;
+  document.body.classList.toggle("hud-minimal", hudHidden);
+  if (btnHud) btnHud.textContent = hudHidden ? "Show HUD (H)" : "Hide HUD (H)";
+}
+
+function toggleHudVisibility() {
+  setHudVisibility(!hudHidden);
+}
+
+function updateHudMetrics(conf: number, mode: GazeFilterMode, tMs: number) {
+  if (hudConfEl) hudConfEl.textContent = conf.toFixed(2);
+  if (hudFilterModeEl) hudFilterModeEl.textContent = mode;
+  if (hudCalibRmseEl && (lastHudCalibrationReadMs < 0 || (tMs - lastHudCalibrationReadMs) > 900)) {
+    const cal = loadCalibrationStatsFromStorage();
+    hudCalibRmseEl.textContent = cal ? `${cal.rmse.toFixed(3)} (${cal.tier ?? "saved"})` : "n/a";
+    lastHudCalibrationReadMs = tMs;
+  }
+}
+
+function updateGazeReticle(gaze: THREE.Vector2, conf: number) {
+  if (FINAL_SINGLE_DEMO) return;
+  if (!gazeReticle) return;
+  const outRect = cOut.getBoundingClientRect();
+  const hostRect = cOut.parentElement?.getBoundingClientRect();
+  if (!hostRect || outRect.width <= 0 || outRect.height <= 0) return;
+
+  const x = outRect.left - hostRect.left + ((gaze.x + 1) * 0.5) * outRect.width;
+  const y = outRect.top - hostRect.top + ((-gaze.y + 1) * 0.5) * outRect.height;
+  const confNorm = clamp((conf - 0.25) / 0.55, 0, 1);
+  const opacity = lerp(0.28, 1.0, confNorm);
+  const scale = lerp(1.28, 0.84, confNorm);
+
+  gazeReticle.style.left = `${x.toFixed(1)}px`;
+  gazeReticle.style.top = `${y.toFixed(1)}px`;
+  gazeReticle.style.opacity = opacity.toFixed(3);
+  gazeReticle.style.transform = `translate(-50%, -50%) scale(${scale.toFixed(3)})`;
+}
+
+btnFullscreen?.addEventListener("click", () => { void toggleFullscreenStage(); });
+btnHud?.addEventListener("click", () => toggleHudVisibility());
+document.addEventListener("fullscreenchange", updateFullscreenButtonLabel);
+setHudVisibility(document.body.classList.contains("final-single"));
+updateFullscreenButtonLabel();
 
 // ---------- GAZE (eye tracking + mouse fallback) ----------
 const gazeNDC = new THREE.Vector2(0, 0);
@@ -1196,41 +408,35 @@ const EYE_HOLD_MS = 900;
 const MOUSE_FOLLOW_FAST = 0.55;
 const MOUSE_FOLLOW_SLOW = 0.10;
 
-// Adaptive gaze estimator (measurement -> estimate) before patch controller.
-const EST_DEADZONE_X = 0.018;
-const EST_DEADZONE_Y = 0.016;
-const EST_POS_GAIN_FIX = 0.19;
-const EST_POS_GAIN_SAC = 0.56;
-const EST_VEL_GAIN_FIX = 0.060;
-const EST_VEL_GAIN_SAC = 0.16;
-const EST_MAX_STEP_FIX_X = 0.022;
-const EST_MAX_STEP_FIX_Y = 0.020;
-const EST_MAX_STEP_SAC_X = 0.120;
-const EST_MAX_STEP_SAC_Y = 0.100;
-const EST_MAX_VEL_X = 2.8;
-const EST_MAX_VEL_Y = 2.4;
-const EST_VEL_DAMP_FIX = 0.76;
-const EST_VEL_DAMP_SAC = 0.84;
-const EST_SACCADE_ENTER_SPEED = 1.85;
-const EST_SACCADE_EXIT_SPEED = 0.75;
-const EST_MODE_HOLD_MS = 62;
-const EST_RIGHT_DAMP = 0.90;
+// Adaptive Kalman CV estimator (single filter stage for both precision and stability).
+const KALMAN_SACCADE_ENTER_SPEED = 1.55;
+const KALMAN_SACCADE_EXIT_SPEED = 0.70;
+const KALMAN_MODE_HOLD_MS = 70;
+const KALMAN_MEAS_SIGMA_EYE_LOW = 0.060;
+const KALMAN_MEAS_SIGMA_EYE_HIGH = 0.013;
+const KALMAN_MEAS_SIGMA_FALLBACK = 0.028;
+const KALMAN_ACC_SIGMA_FIX_LOW = 5.8;
+const KALMAN_ACC_SIGMA_FIX_HIGH = 2.0;
+const KALMAN_ACC_SIGMA_SAC_LOW = 17.0;
+const KALMAN_ACC_SIGMA_SAC_HIGH = 10.0;
+const KALMAN_ACC_SIGMA_FALLBACK = 7.5;
+const KALMAN_POS_VAR_INIT = 0.09;
+const KALMAN_VEL_VAR_INIT = 7.2;
+const KALMAN_VEL_LIMIT = 4.8;
 
-// Additional control smoothing dedicated to patch positioning/zoom window.
+type AxisKalman = {
+  pos: number;
+  vel: number;
+  pPosPos: number;
+  pPosVel: number;
+  pVelVel: number;
+};
+
+const kalmanX: AxisKalman = { pos: 0, vel: 0, pPosPos: KALMAN_POS_VAR_INIT, pPosVel: 0, pVelVel: KALMAN_VEL_VAR_INIT };
+const kalmanY: AxisKalman = { pos: 0, vel: 0, pPosPos: KALMAN_POS_VAR_INIT, pPosVel: 0, pVelVel: KALMAN_VEL_VAR_INIT };
+
+// Unified control signal for patch and final lens.
 const gazeFocusNDC = new THREE.Vector2(0, 0);
-let gazeFocusInit = false;
-const FOCUS_DEADZONE = 0.015;
-const FOCUS_DEADZONE_X = 0.017;
-const FOCUS_DEADZONE_Y = 0.015;
-const FOCUS_SLOW = 0.20;
-const FOCUS_FAST = 0.33;
-const FOCUS_SUPER_FAST = 0.56;
-const FOCUS_MED_DIST = 0.10;
-const FOCUS_BIG_DIST = 0.24;
-const FOCUS_MAX_STEP = 0.040;
-const FOCUS_MAX_STEP_X = 0.033;
-const FOCUS_MAX_STEP_Y = 0.035;
-const FOCUS_MOUSE_FOLLOW = 0.42;
 const PATCH_SENSITIVITY_X = 0.88;
 const PATCH_SENSITIVITY_Y = 0.80;
 const PATCH_EDGE_SNAP_PX = 3;
@@ -1252,12 +458,58 @@ function setGazeFilterMode(next: GazeFilterMode, tMs: number) {
   gazeFilterModeSinceMs = tMs;
 }
 
+function resetAxisKalman(axis: AxisKalman, pos: number, vel = 0) {
+  axis.pos = pos;
+  axis.vel = vel;
+  axis.pPosPos = KALMAN_POS_VAR_INIT;
+  axis.pPosVel = 0;
+  axis.pVelVel = KALMAN_VEL_VAR_INIT;
+}
+
+function predictAxisKalman(axis: AxisKalman, dt: number, sigmaAcc: number) {
+  const sigma2 = sigmaAcc * sigmaAcc;
+  const dt2 = dt * dt;
+  const dt3 = dt2 * dt;
+  const dt4 = dt2 * dt2;
+  const q11 = 0.25 * dt4 * sigma2;
+  const q12 = 0.5 * dt3 * sigma2;
+  const q22 = dt2 * sigma2;
+
+  axis.pos = axis.pos + axis.vel * dt;
+  const p00 = axis.pPosPos + 2 * dt * axis.pPosVel + dt2 * axis.pVelVel + q11;
+  const p01 = axis.pPosVel + dt * axis.pVelVel + q12;
+  const p11 = axis.pVelVel + q22;
+  axis.pPosPos = p00;
+  axis.pPosVel = p01;
+  axis.pVelVel = p11;
+}
+
+function correctAxisKalman(axis: AxisKalman, measurement: number, sigmaMeas: number) {
+  const r = sigmaMeas * sigmaMeas;
+  const innovation = measurement - axis.pos;
+  const s = axis.pPosPos + r;
+  const safeS = Math.max(s, 1e-9);
+  const kPos = axis.pPosPos / safeS;
+  const kVel = axis.pPosVel / safeS;
+
+  const p01Prev = axis.pPosVel;
+  const p11Prev = axis.pVelVel;
+  axis.pos += kPos * innovation;
+  axis.vel += kVel * innovation;
+  axis.pPosPos = Math.max((1 - kPos) * axis.pPosPos, 1e-8);
+  axis.pPosVel = (1 - kPos) * p01Prev;
+  axis.pVelVel = Math.max(p11Prev - kVel * p01Prev, 1e-8);
+}
+
 function updateGazeEstimate(target: THREE.Vector2, useEye: boolean, conf = 0, tMs = performance.now()) {
   if (!gazeEstInit) {
     gazeEstInit = true;
     gazeEstLastMs = tMs;
     gazeEstNDC.copy(target);
     gazeVelNDC.set(0, 0);
+    resetAxisKalman(kalmanX, target.x, 0);
+    resetAxisKalman(kalmanY, target.y, 0);
+    gazeFocusNDC.copy(target);
     gazeFilterMode = useEye ? "fixation" : "fallback";
     gazeFilterModeSinceMs = tMs;
     return;
@@ -1265,112 +517,47 @@ function updateGazeEstimate(target: THREE.Vector2, useEye: boolean, conf = 0, tM
 
   const dt = clamp((tMs - gazeEstLastMs) / 1000, 1 / 240, 0.080);
   gazeEstLastMs = tMs;
+  const predX = kalmanX.pos + kalmanX.vel * dt;
+  const predY = kalmanY.pos + kalmanY.vel * dt;
+  const innovationX = target.x - predX;
+  const innovationY = target.y - predY;
+  const innovationSpeed = Math.hypot(innovationX, innovationY) / Math.max(dt, 1e-4);
+  const modeAgeMs = tMs - gazeFilterModeSinceMs;
 
   if (!useEye) {
     setGazeFilterMode("fallback", tMs);
-    gazeEstNDC.lerp(target, FOCUS_MOUSE_FOLLOW);
-    gazeVelNDC.multiplyScalar(0.70);
-    return;
-  }
-
-  const predX = gazeEstNDC.x + gazeVelNDC.x * dt;
-  const predY = gazeEstNDC.y + gazeVelNDC.y * dt;
-  let errX = target.x - predX;
-  let errY = target.y - predY;
-
-  const innovationSpeed = Math.hypot(errX, errY) / Math.max(dt, 1e-4);
-  const modeAgeMs = tMs - gazeFilterModeSinceMs;
-
-  if (gazeFilterMode !== "saccade" && innovationSpeed >= EST_SACCADE_ENTER_SPEED && modeAgeMs >= EST_MODE_HOLD_MS) {
+  } else if (gazeFilterMode !== "saccade" && innovationSpeed >= KALMAN_SACCADE_ENTER_SPEED && modeAgeMs >= KALMAN_MODE_HOLD_MS) {
     setGazeFilterMode("saccade", tMs);
-  } else if (gazeFilterMode === "saccade" && innovationSpeed <= EST_SACCADE_EXIT_SPEED && modeAgeMs >= EST_MODE_HOLD_MS) {
+  } else if (gazeFilterMode === "saccade" && innovationSpeed <= KALMAN_SACCADE_EXIT_SPEED && modeAgeMs >= KALMAN_MODE_HOLD_MS) {
     setGazeFilterMode("fixation", tMs);
   } else if (gazeFilterMode === "fallback") {
     setGazeFilterMode("fixation", tMs);
   }
 
-  const isSaccade = gazeFilterMode === "saccade";
-  const confBoost = clamp((conf - 0.35) / 0.55, 0, 1);
+  const confNorm = useEye ? clamp((conf - 0.30) / 0.55, 0, 1) : 0;
+  let sigmaMeas = useEye
+    ? lerp(KALMAN_MEAS_SIGMA_EYE_LOW, KALMAN_MEAS_SIGMA_EYE_HIGH, confNorm)
+    : KALMAN_MEAS_SIGMA_FALLBACK;
+  let sigmaAcc = useEye
+    ? (gazeFilterMode === "saccade"
+      ? lerp(KALMAN_ACC_SIGMA_SAC_LOW, KALMAN_ACC_SIGMA_SAC_HIGH, confNorm)
+      : lerp(KALMAN_ACC_SIGMA_FIX_LOW, KALMAN_ACC_SIGMA_FIX_HIGH, confNorm))
+    : KALMAN_ACC_SIGMA_FALLBACK;
 
-  if (!isSaccade) {
-    const dzX = lerp(EST_DEADZONE_X, EST_DEADZONE_X * 0.6, confBoost);
-    const dzY = lerp(EST_DEADZONE_Y, EST_DEADZONE_Y * 0.6, confBoost);
-    if (Math.abs(errX) < dzX) errX = 0;
-    if (Math.abs(errY) < dzY) errY = 0;
-  }
+  predictAxisKalman(kalmanX, dt, sigmaAcc);
+  predictAxisKalman(kalmanY, dt, sigmaAcc);
+  correctAxisKalman(kalmanX, target.x, sigmaMeas);
+  correctAxisKalman(kalmanY, target.y, sigmaMeas);
 
-  const rightDamp = (target.x > 0 || predX > 0) ? EST_RIGHT_DAMP : 1.0;
-  const posGain = isSaccade ? EST_POS_GAIN_SAC : EST_POS_GAIN_FIX;
-  const velGain = isSaccade ? EST_VEL_GAIN_SAC : EST_VEL_GAIN_FIX;
-  const gainBoost = lerp(0.95, 1.20, confBoost);
-
-  const maxStepX = (isSaccade ? EST_MAX_STEP_SAC_X : EST_MAX_STEP_FIX_X) * rightDamp;
-  const maxStepY = isSaccade ? EST_MAX_STEP_SAC_Y : EST_MAX_STEP_FIX_Y;
-
-  const stepX = clamp(errX * posGain * gainBoost, -maxStepX, maxStepX);
-  const stepY = clamp(errY * posGain * gainBoost, -maxStepY, maxStepY);
+  kalmanX.vel = clamp(kalmanX.vel, -KALMAN_VEL_LIMIT, KALMAN_VEL_LIMIT);
+  kalmanY.vel = clamp(kalmanY.vel, -KALMAN_VEL_LIMIT, KALMAN_VEL_LIMIT);
 
   gazeEstNDC.set(
-    clamp(predX + stepX, -1, 1),
-    clamp(predY + stepY, -1, 1)
+    clamp(kalmanX.pos, -1, 1),
+    clamp(kalmanY.pos, -1, 1)
   );
-
-  const velTargetX = clamp((stepX / dt) * velGain, -EST_MAX_VEL_X, EST_MAX_VEL_X);
-  const velTargetY = clamp((stepY / dt) * velGain, -EST_MAX_VEL_Y, EST_MAX_VEL_Y);
-  const velDamp = isSaccade ? EST_VEL_DAMP_SAC : EST_VEL_DAMP_FIX;
-  gazeVelNDC.set(
-    clamp(gazeVelNDC.x * velDamp + velTargetX, -EST_MAX_VEL_X, EST_MAX_VEL_X),
-    clamp(gazeVelNDC.y * velDamp + velTargetY, -EST_MAX_VEL_Y, EST_MAX_VEL_Y)
-  );
-}
-
-function updatePatchFocus(target: THREE.Vector2, useEye: boolean, conf = 0, mode: GazeFilterMode = "fallback") {
-  if (!gazeFocusInit) {
-    gazeFocusInit = true;
-    gazeFocusNDC.copy(target);
-    return;
-  }
-
-  if (!useEye) {
-    // Mouse fallback should stay responsive.
-    gazeFocusNDC.lerp(target, FOCUS_MOUSE_FOLLOW);
-    return;
-  }
-
-  const leadSec = mode === "saccade" ? 0.060 : 0.034;
-  const tx = clamp(target.x + gazeVelNDC.x * leadSec, -1, 1);
-  const ty = clamp(target.y + gazeVelNDC.y * leadSec, -1, 1);
-  const dx = tx - gazeFocusNDC.x;
-  const dy = ty - gazeFocusNDC.y;
-  const confBoost = clamp((conf - 0.45) / 0.45, 0, 1);
-  const dzX = lerp(FOCUS_DEADZONE_X, FOCUS_DEADZONE_X * 0.65, confBoost);
-  const dzY = lerp(FOCUS_DEADZONE_Y, FOCUS_DEADZONE_Y * 0.65, confBoost);
-  const effDx = Math.abs(dx) < dzX ? 0 : dx;
-  const effDy = Math.abs(dy) < dzY ? 0 : dy;
-  if (effDx === 0 && effDy === 0) return;
-
-  const dist = Math.sqrt(effDx * effDx + effDy * effDy);
-  if (dist < FOCUS_DEADZONE) return;
-
-  let follow = FOCUS_SLOW;
-  if (dist > FOCUS_BIG_DIST) follow = FOCUS_SUPER_FAST;
-  else if (dist > FOCUS_MED_DIST) follow = FOCUS_FAST;
-  if (mode === "fixation") follow *= 0.96;
-  else if (mode === "saccade") follow *= 1.30;
-  follow *= lerp(1.0, 1.25, confBoost);
-
-  const modeStepScale = mode === "saccade" ? 1.32 : (mode === "fixation" ? 0.98 : 1.0);
-  const maxStep = dist > 0.35 ? (FOCUS_MAX_STEP * 1.35 * modeStepScale) : (FOCUS_MAX_STEP * modeStepScale);
-  const maxStepGain = lerp(1.0, 1.22, confBoost);
-  const maxStepX = Math.min(maxStep * maxStepGain, FOCUS_MAX_STEP_X * 1.25);
-  const maxStepY = Math.min(maxStep * maxStepGain, FOCUS_MAX_STEP_Y * 1.25);
-  const stepX = clamp(effDx * follow, -maxStepX, maxStepX);
-  const stepY = clamp(effDy * follow, -maxStepY, maxStepY);
-
-  gazeFocusNDC.set(
-    clamp(gazeFocusNDC.x + stepX, -1, 1),
-    clamp(gazeFocusNDC.y + stepY, -1, 1)
-  );
+  gazeVelNDC.set(kalmanX.vel, kalmanY.vel);
+  gazeFocusNDC.copy(gazeEstNDC);
 }
 
 // ---------- WORKLOAD ENCODER STATE ----------
@@ -1380,6 +567,14 @@ let patchMode = 4; // default to reading demo
 const ROI_SCALE = 0.78; // Bigger focus box for easier visual validation
 const ROI_W = Math.floor(PATCH_W * ROI_SCALE);
 const ROI_H = Math.floor(PATCH_H * ROI_SCALE);
+const READING_ZOOM_FRAME_STATIC = true;
+const READING_ZOOM_SRC_ALPHA = 0.24;
+const READING_ZOOM_SRC_ALPHA_LOW_CONF = 0.12;
+const READING_ZOOM_SRC_MAX_STEP_PX = 24;
+const READING_ZOOM_SRC_DEADBAND_PX = 2;
+let readingZoomSrcInit = false;
+let readingZoomSrcX = 0;
+let readingZoomSrcY = 0;
 
 const READING_SUPERSAMPLE = 2;
 const readingCanvas = document.createElement("canvas");
@@ -1388,253 +583,127 @@ readingCanvas.height = PATCH_H * READING_SUPERSAMPLE;
 const readingCtx = readingCanvas.getContext("2d", { alpha: false });
 if (!readingCtx) throw new Error("Failed to create reading demo canvas");
 
-function drawWrappedText(
-  ctx: CanvasRenderingContext2D,
-  text: string,
-  x: number,
-  y: number,
-  maxWidth: number,
-  lineHeight: number
+const FINAL_SUPERSAMPLE = 1;
+const finalSceneCanvas = document.createElement("canvas");
+finalSceneCanvas.width = FULL_W * FINAL_SUPERSAMPLE;
+finalSceneCanvas.height = FULL_H * FINAL_SUPERSAMPLE;
+const finalSceneCtx = finalSceneCanvas.getContext("2d", { alpha: false });
+if (!finalSceneCtx) throw new Error("Failed to create final scene canvas");
+let finalLensX = FULL_W * 0.5;
+let finalLensY = FULL_H * 0.5;
+let finalLensVx = 0;
+let finalLensVy = 0;
+
+function stepCriticallyDampedAxis(
+  pos: number,
+  vel: number,
+  target: number,
+  omega: number,
+  dt: number
 ) {
-  const words = text.split(" ");
-  let line = "";
-  let yy = y;
-
-  for (const w of words) {
-    const candidate = line ? `${line} ${w}` : w;
-    if (ctx.measureText(candidate).width > maxWidth && line) {
-      ctx.fillText(line, x, yy);
-      yy += lineHeight;
-      line = w;
-    } else {
-      line = candidate;
-    }
+  const dx = target - pos;
+  let accel = (omega * omega * dx) - (2 * omega * vel);
+  accel = clamp(accel, -FINAL_LENS_MAX_ACCEL, FINAL_LENS_MAX_ACCEL);
+  vel = clamp(vel + accel * dt, -FINAL_LENS_MAX_SPEED, FINAL_LENS_MAX_SPEED);
+  pos = pos + vel * dt;
+  if (Math.abs(target - pos) < 0.35 && Math.abs(vel) < 12) {
+    pos = target;
+    vel = 0;
   }
-  if (line) {
-    ctx.fillText(line, x, yy);
-    yy += lineHeight;
-  }
-  return yy;
+  return { pos, vel };
 }
 
-function drawReadingDemoPage(ctx: CanvasRenderingContext2D, _tSec: number) {
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, readingCanvas.width, readingCanvas.height);
-  ctx.setTransform(READING_SUPERSAMPLE, 0, 0, READING_SUPERSAMPLE, 0, 0);
-
-  ctx.fillStyle = "#f6f2e8";
-  ctx.fillRect(0, 0, PATCH_W, PATCH_H);
-
-  ctx.fillStyle = "#1d1d1d";
-  ctx.font = "bold 30px Georgia, serif";
-  ctx.textAlign = "left";
-  ctx.textBaseline = "top";
-  ctx.fillText("Foveated Reading Demo", 28, 18);
-
-  ctx.fillStyle = "#4a4a4a";
-  ctx.font = "17px Georgia, serif";
-  ctx.fillText("Leggi il testo: il riquadro zoom deve seguire il tuo sguardo.", 28, 58);
-
-  const paragraphs = [
-    "La resa foveata mostra piu dettaglio nella zona osservata e riduce il costo nella periferia.",
-    "Quando il tracking e calibrato bene, il testo resta nitido vicino al punto in cui stai guardando.",
-    "Se noti jitter o salti, ripeti la calibrazione in luce uniforme e mantieni la testa piu stabile.",
-    "Sposta lo sguardo tra sinistra, centro e destra: il riquadro dovrebbe seguire in modo fluido."
-  ];
-
-  ctx.fillStyle = "#292929";
-  ctx.font = "22px Georgia, serif";
-  let y = 118;
-  for (const p of paragraphs) {
-    y = drawWrappedText(ctx, p, 34, y, PATCH_W - 68, 30) + 10;
-  }
-
-  const markerY = 474;
-  ctx.fillStyle = "rgba(255, 188, 88, 0.24)";
-  ctx.fillRect(28, markerY, PATCH_W - 56, 38);
-  ctx.strokeStyle = "rgba(200, 120, 30, 0.72)";
-  ctx.lineWidth = 1.7;
-  ctx.strokeRect(28, markerY, PATCH_W - 56, 38);
-
-  ctx.fillStyle = "#373737";
-  ctx.font = "19px Georgia, serif";
-  ctx.fillText("Riga guida: prova a fissare questa frase per 2 secondi.", 36, markerY + 8);
-
-  // Page frame
-  ctx.strokeStyle = "rgba(0,0,0,0.24)";
-  ctx.lineWidth = 2;
-  ctx.strokeRect(16, 12, PATCH_W - 32, PATCH_H - 24);
-
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-}
-
-function ensureAnalysisOverlay() {
-  if (ANALYSIS.overlay && ANALYSIS.statusEl) return;
-  const o = document.createElement("div");
-  o.style.position = "fixed";
-  o.style.left = "14px";
-  o.style.bottom = "14px";
-  o.style.maxWidth = "560px";
-  o.style.padding = "10px 12px";
-  o.style.background = "rgba(8,12,18,0.72)";
-  o.style.border = "1px solid rgba(150, 205, 255, 0.45)";
-  o.style.borderRadius = "8px";
-  o.style.color = "#d7ebff";
-  o.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
-  o.style.fontSize = "12px";
-  o.style.lineHeight = "1.4";
-  o.style.zIndex = "9998";
-  o.style.pointerEvents = "none";
-  o.style.display = "none";
-  o.innerHTML = `
-    <div><b>Reading Analysis</b> (auto-record)</div>
-    <div id="analysis-status" style="margin-top:4px;opacity:0.95;">Idle</div>
-  `;
-  document.body.appendChild(o);
-  ANALYSIS.overlay = o;
-  ANALYSIS.statusEl = o.querySelector("#analysis-status") as HTMLDivElement;
-}
-
-function setAnalysisStatus(msg: string, visible = true) {
-  ensureAnalysisOverlay();
-  if (ANALYSIS.statusEl) ANALYSIS.statusEl.textContent = msg;
-  if (ANALYSIS.overlay) ANALYSIS.overlay.style.display = visible ? "block" : "none";
-}
-
-function hideAnalysisStatus(delayMs = 0) {
-  ensureAnalysisOverlay();
-  if (delayMs <= 0) {
-    if (!ANALYSIS.running && ANALYSIS.overlay) ANALYSIS.overlay.style.display = "none";
-    return;
-  }
-  window.setTimeout(() => {
-    if (!ANALYSIS.running && ANALYSIS.overlay) ANALYSIS.overlay.style.display = "none";
-  }, delayMs);
-}
-
-function percentile(values: number[], q: number) {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const idx = clamp(Math.floor((sorted.length - 1) * q), 0, sorted.length - 1);
-  return sorted[idx];
-}
-
-function mean(values: number[]) {
-  if (values.length === 0) return 0;
-  return values.reduce((s, v) => s + v, 0) / values.length;
-}
-
-function rmsStep(
-  samples: ReadingAnalysisSample[],
-  include: (_prev: ReadingAnalysisSample, _cur: ReadingAnalysisSample) => boolean
+function renderFinalLensOutput(
+  gaze: THREE.Vector2,
+  conf: number,
+  timeSec: number,
+  dtSec: number,
+  mode: GazeFilterMode
 ) {
-  let se = 0;
-  let n = 0;
-  for (let i = 1; i < samples.length; i++) {
-    const prev = samples[i - 1];
-    const cur = samples[i];
-    if (!include(prev, cur)) continue;
-    const dx = cur.filt_x - prev.filt_x;
-    const dy = cur.filt_y - prev.filt_y;
-    se += dx * dx + dy * dy;
-    n++;
-  }
-  return n > 0 ? Math.sqrt(se / n) : 0;
-}
+  if (!finalOutCtx) return;
 
-function countEyeDropouts(samples: ReadingAnalysisSample[]) {
-  let cnt = 0;
-  let inDrop = false;
-  for (const s of samples) {
-    if (!s.use_eye) {
-      if (!inDrop) {
-        cnt++;
-        inDrop = true;
-      }
-    } else {
-      inDrop = false;
-    }
-  }
-  return cnt;
-}
+  drawReadingDemoPage(finalSceneCtx, FULL_W, FULL_H, FINAL_SUPERSAMPLE, timeSec);
 
-function gazeToPatchCenterNorm(gazeX: number, gazeY: number) {
-  const gx = clamp(gazeX * PATCH_SENSITIVITY_X, -1, 1);
-  const gy = clamp(gazeY * PATCH_SENSITIVITY_Y, -1, 1);
-  const minCx = (PATCH_W * 0.5) / FULL_W;
-  const maxCx = 1 - minCx;
-  const minCy = (PATCH_H * 0.5) / FULL_H;
-  const maxCy = 1 - minCy;
-  const cx = clamp(gx * 0.5 + 0.5, minCx, maxCx);
-  const cy = clamp((-gy) * 0.5 + 0.5, minCy, maxCy);
-  return { cx, cy };
-}
+  finalOutCtx.save();
+  finalOutCtx.filter = "blur(5.2px) saturate(0.88)";
+  finalOutCtx.drawImage(
+    finalSceneCanvas,
+    0, 0, finalSceneCanvas.width, finalSceneCanvas.height,
+    0, 0, FULL_W, FULL_H
+  );
+  finalOutCtx.restore();
 
-function buildReadingAnalysisSummary(
-  reason: ReadingAnalysisStopReason,
-  samples: ReadingAnalysisSample[],
-  durationMs: number,
-  calibration: CalibrationStats | null,
-  calibrationAttempted: CalibrationStats | null
-) {
-  const confVals = samples.map((s) => s.conf);
-  const eyeSamples = samples.filter((s) => s.use_eye);
-  const eyeConfVals = eyeSamples.map((s) => s.conf);
-  const eyeUsageRatio = samples.length > 0 ? eyeSamples.length / samples.length : 0;
-  const jitterAll = rmsStep(samples, () => true);
-  const jitterLeft = rmsStep(samples, (_p, c) => c.filt_x < 0);
-  const jitterRight = rmsStep(samples, (_p, c) => c.filt_x >= 0);
-  const rightLeftRatio = jitterLeft > 1e-6 ? (jitterRight / jitterLeft) : null;
-  const ctrlVsFilt = mean(samples.map((s) => Math.hypot(s.ctrl_x - s.filt_x, s.ctrl_y - s.filt_y)));
-  const estVsFilt = mean(samples.map((s) => Math.hypot(s.est_x - s.filt_x, s.est_y - s.filt_y)));
-  const patchTrackErrRaw = mean(samples.map((s) => {
-    const nx = (s.filt_x + 1) * 0.5;
-    const ny = (-s.filt_y + 1) * 0.5;
-    return Math.hypot(nx - s.patch_cx, ny - s.patch_cy);
-  }));
-  const patchTrackErr = mean(samples.map((s) => {
-    const expected = gazeToPatchCenterNorm(s.filt_x, s.filt_y);
-    return Math.hypot(expected.cx - s.patch_cx, expected.cy - s.patch_cy);
-  }));
-  const dropouts = countEyeDropouts(samples);
+  finalOutCtx.save();
+  finalOutCtx.globalAlpha = 0.34;
+  finalOutCtx.drawImage(
+    finalSceneCanvas,
+    0, 0, finalSceneCanvas.width, finalSceneCanvas.height,
+    0, 0, FULL_W, FULL_H
+  );
+  finalOutCtx.restore();
 
-  const notes: string[] = [];
-  if (eyeUsageRatio < 0.70) notes.push("Eye lock debole: troppi fallback o perdita confidenza.");
-  if (rightLeftRatio != null && rightLeftRatio > 1.20) notes.push("Instabilita maggiore a destra rispetto a sinistra.");
-  if (estVsFilt > 0.038) notes.push("Filtro troppo conservativo: si percepisce ritardo durante i movimenti.");
-  if (patchTrackErr > 0.040) notes.push("Lag/mismatch visibile tra gaze filtrato e centro patch.");
-  if (percentile(confVals, 0.10) < 0.25) notes.push("Confidenza spesso bassa: migliorare luce e posizione camera.");
-  if (!calibration) notes.push("Calibrazione attiva non disponibile nel report: run considerato diagnostico.");
-  if (calibration?.tier === "provisional") notes.push("Calibrazione provvisoria in uso: ripetere calibrazione per una baseline piu robusta.");
-  if (calibration && calibration.rmse > CALIB_RMSE_ACCEPT_MAX) notes.push("Calibrazione in uso debole: ripetere calibrazione prima del tuning fine.");
-  if (notes.length === 0) notes.push("Sessione abbastanza stabile; resta da rifinire tuning fine.");
+  const confNorm = clamp((conf - 0.30) / 0.55, 0, 1);
+  const leadSec = mode === "saccade"
+    ? FINAL_LENS_LEAD_SAC_SEC
+    : (mode === "fixation" ? FINAL_LENS_LEAD_FIX_SEC : FINAL_LENS_LEAD_FALLBACK_SEC);
+  const leadXNorm = gazeVelNDC.x * leadSec;
+  const leadYNorm = gazeVelNDC.y * leadSec;
+  const targetX = clamp(((gaze.x + leadXNorm) + 1) * 0.5, 0, 1) * FULL_W;
+  const targetY = clamp(((-(gaze.y + leadYNorm)) + 1) * 0.5, 0, 1) * FULL_H;
+  const omegaBase = mode === "saccade"
+    ? FINAL_LENS_OMEGA_SAC
+    : (mode === "fixation" ? FINAL_LENS_OMEGA_FIX : FINAL_LENS_OMEGA_FALLBACK);
+  const distPx = Math.hypot(targetX - finalLensX, targetY - finalLensY);
+  const distBoost = clamp((distPx - 28) / 160, 0, 1);
+  const omega = omegaBase * lerp(0.95, 1.20, confNorm) * lerp(1.0, 1.26, distBoost);
+  const lensStepX = stepCriticallyDampedAxis(finalLensX, finalLensVx, targetX, omega, dtSec);
+  const lensStepY = stepCriticallyDampedAxis(finalLensY, finalLensVy, targetY, omega, dtSec);
+  finalLensX = lensStepX.pos;
+  finalLensY = lensStepY.pos;
+  finalLensVx = lensStepX.vel;
+  finalLensVy = lensStepY.vel;
 
-  return {
-    version: 1,
-    created_at_iso: new Date().toISOString(),
-    reason,
-    duration_ms: Math.round(durationMs),
-    samples: samples.length,
-    calibration,
-    calibration_attempted: calibrationAttempted,
-    metrics: {
-      eye_usage_ratio: +eyeUsageRatio.toFixed(4),
-      conf_mean: +mean(confVals).toFixed(4),
-      conf_p10: +percentile(confVals, 0.10).toFixed(4),
-      conf_p90: +percentile(confVals, 0.90).toFixed(4),
-      conf_mean_when_eye: +mean(eyeConfVals).toFixed(4),
-      jitter_rms_step_all: +jitterAll.toFixed(6),
-      jitter_rms_step_left: +jitterLeft.toFixed(6),
-      jitter_rms_step_right: +jitterRight.toFixed(6),
-      jitter_right_left_ratio: rightLeftRatio == null ? null : +rightLeftRatio.toFixed(4),
-      ctrl_vs_filt_mean_dist: +ctrlVsFilt.toFixed(6),
-      est_vs_filt_mean_dist: +estVsFilt.toFixed(6),
-      patch_track_error_mean: +patchTrackErr.toFixed(6),
-      patch_track_error_raw_mean: +patchTrackErrRaw.toFixed(6),
-      eye_dropouts: dropouts
-    },
-    notes
-  };
+  const lensR = lerp(FINAL_LENS_MAX_RADIUS_PX, FINAL_LENS_MIN_RADIUS_PX, confNorm);
+
+  finalOutCtx.save();
+  finalOutCtx.beginPath();
+  finalOutCtx.arc(finalLensX, finalLensY, lensR, 0, Math.PI * 2);
+  finalOutCtx.clip();
+  finalOutCtx.drawImage(
+    finalSceneCanvas,
+    0, 0, finalSceneCanvas.width, finalSceneCanvas.height,
+    0, 0, FULL_W, FULL_H
+  );
+  finalOutCtx.restore();
+
+  // Lens ring: brighter border + subtle glow to communicate the optical focus.
+  finalOutCtx.save();
+  const halo = finalOutCtx.createRadialGradient(
+    finalLensX, finalLensY, lensR * 0.70,
+    finalLensX, finalLensY, lensR * 1.12
+  );
+  halo.addColorStop(0, "rgba(255, 220, 140, 0.00)");
+  halo.addColorStop(1, "rgba(255, 208, 120, 0.32)");
+  finalOutCtx.fillStyle = halo;
+  finalOutCtx.beginPath();
+  finalOutCtx.arc(finalLensX, finalLensY, lensR * 1.12, 0, Math.PI * 2);
+  finalOutCtx.fill();
+
+  finalOutCtx.shadowColor = "rgba(255, 214, 130, 0.55)";
+  finalOutCtx.shadowBlur = 22;
+  finalOutCtx.lineWidth = 3.2;
+  finalOutCtx.strokeStyle = "rgba(255, 235, 188, 0.96)";
+  finalOutCtx.beginPath();
+  finalOutCtx.arc(finalLensX, finalLensY, lensR, 0, Math.PI * 2);
+  finalOutCtx.stroke();
+
+  finalOutCtx.shadowBlur = 0;
+  finalOutCtx.strokeStyle = "rgba(255, 255, 255, 0.62)";
+  finalOutCtx.lineWidth = 1.6;
+  finalOutCtx.beginPath();
+  finalOutCtx.arc(finalLensX - lensR * 0.14, finalLensY - lensR * 0.14, lensR * 0.42, Math.PI * 0.94, Math.PI * 1.74);
+  finalOutCtx.stroke();
+  finalOutCtx.restore();
 }
 
 function startReadingAnalysis(opts: {
@@ -1666,13 +735,23 @@ function stopReadingAnalysis(reason: ReadingAnalysisStopReason) {
   ANALYSIS.running = false;
   const endedAtMs = performance.now();
   const durationMs = Math.max(0, endedAtMs - ANALYSIS.startedAtMs);
-  const summary = buildReadingAnalysisSummary(
+  const summary = buildReadingAnalysisSummary({
     reason,
-    ANALYSIS.samples,
+    samples: ANALYSIS.samples,
     durationMs,
-    ANALYSIS.calibration,
-    ANALYSIS.calibrationAttempted
-  );
+    calibration: ANALYSIS.calibration,
+    calibrationAttempted: ANALYSIS.calibrationAttempted,
+    config: {
+      fullW: FULL_W,
+      fullH: FULL_H,
+      patchW: PATCH_W,
+      patchH: PATCH_H,
+      patchSensitivityX: PATCH_SENSITIVITY_X,
+      patchSensitivityY: PATCH_SENSITIVITY_Y,
+      analysisSurface: FINAL_SINGLE_DEMO ? "lens" : "patch",
+      calibRmseAcceptMax: CALIB_RMSE_ACCEPT_MAX
+    }
+  });
   ANALYSIS.lastSummary = summary as Record<string, unknown>;
 
   const stamp = makeStamp();
@@ -1711,8 +790,12 @@ function captureReadingAnalysisSample(
   filterMode: GazeFilterMode
 ) {
   if (!ANALYSIS.running) return;
-  const patchCx = patchRectN.x + patchRectN.z * 0.5;
-  const patchCy = patchRectN.y + patchRectN.w * 0.5;
+  const patchCx = FINAL_SINGLE_DEMO
+    ? clamp(finalLensX / FULL_W, 0, 1)
+    : (patchRectN.x + patchRectN.z * 0.5);
+  const patchCy = FINAL_SINGLE_DEMO
+    ? clamp(finalLensY / FULL_H, 0, 1)
+    : (patchRectN.y + patchRectN.w * 0.5);
   ANALYSIS.samples.push({
     t_ms: Math.round(tMs),
     use_eye: useEye,
@@ -1742,7 +825,7 @@ function captureReadingAnalysisSample(
 }
 
 async function runCalibrationThenReadingAnalysis() {
-  if (ANALYSIS.autoPipeline || ANALYSIS.running || calibrating) return;
+  if (ANALYSIS.autoPipeline || ANALYSIS.running || isCalibrationRunning()) return;
   ANALYSIS.autoPipeline = true;
   setAnalysisStatus("Routine auto: calibrazione in corso...", true);
   try {
@@ -2135,341 +1218,28 @@ const tLow = new GpuTimer(rLow);
 // Note: tPatch not used for 2D canvas (no GPU timing available)
 
 // ---------- GAZE PROVIDER (MediaPipe) ----------
-const gaze = new MediapipeGazeProvider({ mirrorX: false, smoothAlpha: 0.20 });
-gaze.loadCalibrationFromStorage(); // se c'è, parte già calibrato
+const gaze = new MediapipeGazeProvider({ mirrorX: false, smoothAlpha: 0.20, eyeOnlyMode: true });
+gaze.loadCalibrationFromStorage(CALIB_STORAGE_KEY); // se c'è, parte già calibrato
 gaze.start().catch(err => {
   console.warn("Gaze provider failed, using mouse only:", err);
 });
 
-// ---------- CALIBRATION OVERLAY ----------
-function makeOverlay() {
-  const o = document.createElement("div");
-  o.style.position = "fixed";
-  o.style.inset = "0";
-  o.style.background = "rgba(0,0,0,0.75)";
-  o.style.zIndex = "9999";
-  o.style.display = "none";
-  o.style.pointerEvents = "auto";
-  o.style.color = "#0ff";
-  o.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
-  o.style.fontSize = "13px";
-  o.innerHTML = `
-    <div style="position:absolute;top:14px;left:14px;max-width:520px;line-height:1.35;">
-      <b>Calibration</b> (5x5 precision mode)<br>
-      Keep your gaze on the dot. Keep your head stable.<br>
-      Press <b>ESC</b> to abort. It will auto-save when done.
-    </div>
-    <div id="cal-status" style="position:absolute;top:84px;left:14px;color:#9ff;opacity:0.95;">Preparing…</div>
-    <div id="cal-dot" style="position:absolute;width:14px;height:14px;border-radius:50%;
-      background:#0ff; box-shadow:0 0 18px rgba(0,255,255,0.55); transform:translate(-50%,-50%);"></div>
-  `;
-  document.body.appendChild(o);
-  const dot = o.querySelector("#cal-dot") as HTMLDivElement;
-  const status = o.querySelector("#cal-status") as HTMLDivElement;
-  return { overlay: o, dot, status };
+// ---------- CALIBRATION ----------
+const calibrationRunner = createCalibrationRunner(gaze);
+
+function isCalibrationRunning() {
+  return calibrationRunner.isRunning();
 }
 
-const { overlay: calOverlay, dot: calDot, status: calStatus } = makeOverlay();
-let calibrating = false;
-
 async function calibrate3x3(): Promise<CalibrationRunResult> {
-  if (calibrating) {
-    return {
-      ok: false,
-      aborted: false,
-      qualityRejected: false,
-      stats: null,
-      appliedStats: loadCalibrationStatsFromStorage()
-    };
-  }
-  calibrating = true;
-  calOverlay.style.display = "block";
-  calStatus.textContent = "Calibration started…";
-  const prevCalibStorage = localStorage.getItem(CALIB_STORAGE_KEY);
-  const prevCalibStats = prevCalibStorage != null ? loadCalibrationStatsFromStorage() : null;
-  let result: CalibrationRunResult = {
-    ok: false,
-    aborted: false,
-    qualityRejected: false,
-    stats: null,
-    appliedStats: prevCalibStats
-  };
-
-  function robustMean(values: number[]) {
-    if (values.length === 0) return 0;
-    const sorted = [...values].sort((a, b) => a - b);
-    const trim = Math.floor(sorted.length * 0.2);
-    const core = (sorted.length - trim * 2) >= 6
-      ? sorted.slice(trim, sorted.length - trim)
-      : sorted;
-    return core.reduce((s, v) => s + v, 0) / core.length;
-  }
-
-  function robustStd(values: number[]) {
-    if (values.length < 2) return 0;
-    const m = robustMean(values);
-    let acc = 0;
-    for (const v of values) {
-      const d = v - m;
-      acc += d * d;
-    }
-    return Math.sqrt(acc / values.length);
-  }
-
-  function projectCalibration(
-    m: {
-      ax: number; bx: number; cx: number;
-      ay: number; by: number; cy: number;
-      pxy?: number; pxx?: number; pyy?: number;
-      qxy?: number; qxx?: number; qyy?: number;
-    },
-    rx: number,
-    ry: number
-  ) {
-    const rx2 = rx * rx;
-    const ry2 = ry * ry;
-    const rxy = rx * ry;
-    const px = m.ax + m.bx * rx + m.cx * ry + (m.pxy ?? 0) * rxy + (m.pxx ?? 0) * rx2 + (m.pyy ?? 0) * ry2;
-    const py = m.ay + m.by * rx + m.cy * ry + (m.qxy ?? 0) * rxy + (m.qxx ?? 0) * rx2 + (m.qyy ?? 0) * ry2;
-    return { x: px, y: py };
-  }
-
-  function evalCalibration(
-    samples: { rx: number; ry: number; x: number; y: number }[],
-    m: {
-      ax: number; bx: number; cx: number;
-      ay: number; by: number; cy: number;
-      pxy?: number; pxx?: number; pyy?: number;
-      qxy?: number; qxx?: number; qyy?: number;
-    }
-  ) {
-    let se = 0;
-    let maxErr = 0;
-    let seLeft = 0;
-    let seRight = 0;
-    let nLeft = 0;
-    let nRight = 0;
-    for (const s of samples) {
-      const pr = projectCalibration(m, s.rx, s.ry);
-      const px = pr.x;
-      const py = pr.y;
-      const dx = px - s.x;
-      const dy = py - s.y;
-      const err = Math.sqrt(dx * dx + dy * dy);
-      se += err * err;
-      maxErr = Math.max(maxErr, err);
-      if (s.x < 0) { seLeft += err * err; nLeft++; }
-      else { seRight += err * err; nRight++; }
-    }
-    const rmse = samples.length > 0 ? Math.sqrt(se / samples.length) : Infinity;
-    const leftRmse = nLeft > 0 ? Math.sqrt(seLeft / nLeft) : null;
-    const rightRmse = nRight > 0 ? Math.sqrt(seRight / nRight) : null;
-    return { rmse, maxErr, leftRmse, rightRmse };
-  }
-
-  const waitMs = 420;
-  const maxFrames = 110;
-  const minGoodFrames = 28;
-  const goodConf = 0.34;
-  const stableStdTarget = 0.020;
-  const stableStdRelaxed = 0.028;
-
-  const grid = [-0.82, -0.41, 0.0, 0.41, 0.82];
-  const targets: { x: number; y: number }[] = [];
-  for (let yi = 0; yi < grid.length; yi++) {
-    const ys = grid[yi];
-    const xs = (yi % 2 === 0) ? grid : [...grid].reverse();
-    for (const x of xs) targets.push({ x, y: ys });
-  }
-
-  const samples: { rx: number; ry: number; x: number; y: number; w: number }[] = [];
-
-  const abort = { v: false };
-  const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") abort.v = true; };
-  window.addEventListener("keydown", onKey);
-
-  try {
-    for (let idx = 0; idx < targets.length; idx++) {
-      const t = targets[idx];
-      if (abort.v) break;
-
-      calStatus.textContent = `Point ${idx + 1}/${targets.length} — keep gaze steady`;
-
-      // place dot in screen space from NDC (viewport)
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
-      const sx = ((t.x + 1) * 0.5) * vw;
-      const sy = ((-t.y + 1) * 0.5) * vh;
-      calDot.style.left = `${sx}px`;
-      calDot.style.top = `${sy}px`;
-
-      // settle
-      await new Promise(r => setTimeout(r, waitMs));
-
-      // collect frames (use unmirrored raw for calibration) with retry on unstable point
-      let captured = false;
-      for (let attempt = 1; attempt <= 2 && !captured && !abort.v; attempt++) {
-        const acc: GazeSample[] = [];
-        for (let i = 0; i < maxFrames; i++) {
-          if (abort.v) break;
-          const f = gaze.getFrame();
-          const rawUnmirrored = gaze.getRawUnmirrored();
-          acc.push({ rawX: rawUnmirrored.rawX, rawY: rawUnmirrored.rawY, t: performance.now(), conf: f.conf });
-
-          if ((i % 6) === 0) {
-            const goodNow = acc.filter(s => s.conf >= goodConf);
-            if (goodNow.length >= minGoodFrames) {
-              const sxNow = robustStd(goodNow.map(s => s.rawX));
-              const syNow = robustStd(goodNow.map(s => s.rawY));
-              if (sxNow <= stableStdTarget && syNow <= stableStdTarget) break;
-            }
-          }
-          await new Promise(r => requestAnimationFrame(() => r(null)));
-        }
-
-        const good = acc.filter(s => s.conf >= goodConf);
-        const fallback = acc.filter(s => s.conf >= 0.24);
-        const use = good.length >= minGoodFrames ? good : fallback;
-        if (use.length < 12) {
-          calStatus.textContent = `Point ${idx + 1}/${targets.length} low confidence, retry ${attempt}/2`;
-          await new Promise(r => setTimeout(r, 220));
-          continue;
-        }
-
-        const rx = robustMean(use.map(s => s.rawX));
-        const ry = robustMean(use.map(s => s.rawY));
-        const meanConf = robustMean(use.map(s => s.conf));
-        const sxUse = robustStd(use.map(s => s.rawX));
-        const syUse = robustStd(use.map(s => s.rawY));
-        const stable = Math.max(sxUse, syUse) <= stableStdRelaxed || meanConf >= 0.65;
-
-        if (!stable && attempt < 2) {
-          calStatus.textContent = `Point ${idx + 1}/${targets.length} unstable (${Math.max(sxUse, syUse).toFixed(3)}), retry`;
-          await new Promise(r => setTimeout(r, 220));
-          continue;
-        }
-
-        const weight = clamp(meanConf * meanConf + 0.15, 0.10, 2.50);
-        samples.push({ rx, ry, x: t.x, y: t.y, w: weight });
-        calStatus.textContent = `Point ${idx + 1}/${targets.length} captured (conf ${meanConf.toFixed(2)}, std ${Math.max(sxUse, syUse).toFixed(3)})`;
-        captured = true;
-      }
-    }
-
-    if (abort.v) {
-      calStatus.textContent = "Calibration aborted.";
-      result = { ok: false, aborted: true, qualityRejected: false, stats: null, appliedStats: prevCalibStats };
-      await new Promise(r => setTimeout(r, 350));
-    } else if (samples.length >= 18) {
-      let m = gaze.fitAndSetCalibration(samples);
-      if (m) {
-        const first = evalCalibration(samples, m);
-        const thr = Math.max(0.18, first.rmse * 1.9);
-        const inliers = samples.filter((s) => {
-          const p = projectCalibration(m!, s.rx, s.ry);
-          const px = p.x;
-          const py = p.y;
-          const dx = px - s.x;
-          const dy = py - s.y;
-          return Math.sqrt(dx * dx + dy * dy) <= thr;
-        });
-        if (inliers.length >= Math.max(14, Math.floor(samples.length * 0.65))) {
-          const refined = gaze.fitAndSetCalibration(inliers);
-          if (refined) m = refined;
-        }
-
-        const stats = evalCalibration(samples, m);
-        const calStatsBase: CalibrationStats = {
-          rmse: stats.rmse,
-          maxErr: stats.maxErr,
-          leftRmse: stats.leftRmse,
-          rightRmse: stats.rightRmse,
-          points: samples.length
-        };
-        const l = stats.leftRmse == null ? "n/a" : stats.leftRmse.toFixed(3);
-        const r = stats.rightRmse == null ? "n/a" : stats.rightRmse.toFixed(3);
-
-        const sideWorst = Math.max(stats.leftRmse ?? 0, stats.rightRmse ?? 0);
-        const sideBest = Math.max(1e-6, Math.min(stats.leftRmse ?? sideWorst, stats.rightRmse ?? sideWorst));
-        const sideRatio = sideWorst / sideBest;
-        const sideImbalance = sideWorst > CALIB_SIDE_RMSE_MAX && sideRatio > CALIB_SIDE_RATIO_MAX;
-        const rejectByRmse = stats.rmse > CALIB_RMSE_ACCEPT_MAX;
-        const hasUsablePreviousStats = prevCalibStats != null;
-        const strictAccepted = !rejectByRmse && !sideImbalance;
-        const provisionalCandidate =
-          !sideImbalance &&
-          rejectByRmse &&
-          stats.rmse <= CALIB_RMSE_PROVISIONAL_MAX &&
-          stats.maxErr <= CALIB_MAXERR_PROVISIONAL_MAX &&
-          sideWorst <= CALIB_SIDE_RMSE_PROVISIONAL_MAX &&
-          sideRatio <= CALIB_SIDE_RATIO_PROVISIONAL_MAX;
-        const provisionalAllowed = provisionalCandidate && !hasUsablePreviousStats;
-
-        if (!strictAccepted && !provisionalAllowed) {
-          // Reject poor fits and restore previous calibration state.
-          if (prevCalibStorage != null) {
-            localStorage.setItem(CALIB_STORAGE_KEY, prevCalibStorage);
-            if (!gaze.loadCalibrationFromStorage(CALIB_STORAGE_KEY)) gaze.clearCalibration(CALIB_STORAGE_KEY);
-          } else {
-            gaze.clearCalibration(CALIB_STORAGE_KEY);
-          }
-          saveCalibrationStatsToStorage(prevCalibStats);
-          if (rejectByRmse) {
-            calStatus.textContent = `Calibration rejected. RMSE ${stats.rmse.toFixed(3)} > ${CALIB_RMSE_ACCEPT_MAX.toFixed(2)}.`;
-          } else {
-            calStatus.textContent = `Calibration rejected. L/R imbalance ${sideRatio.toFixed(2)} (worst ${sideWorst.toFixed(3)}).`;
-          }
-          result = {
-            ok: false,
-            aborted: false,
-            qualityRejected: true,
-            stats: calStatsBase,
-            appliedStats: prevCalibStats
-          };
-        } else {
-          const calStats: CalibrationStats = {
-            ...calStatsBase,
-            tier: provisionalAllowed ? "provisional" : "strict"
-          };
-          gaze.saveCalibrationToStorage(CALIB_STORAGE_KEY);
-          saveCalibrationStatsToStorage(calStats);
-          if (provisionalAllowed) {
-            calStatus.textContent =
-              `Calibration provisional. RMSE ${stats.rmse.toFixed(3)} (<= ${CALIB_RMSE_PROVISIONAL_MAX.toFixed(2)}), L/R ${l}/${r}`;
-          } else if (stats.leftRmse != null && stats.rightRmse != null && stats.rightRmse > stats.leftRmse * 1.35) {
-            calStatus.textContent = `Calibration saved. RMSE ${stats.rmse.toFixed(3)} L/R ${l}/${r} (right weaker)`;
-          } else {
-            calStatus.textContent = `Calibration saved. RMSE ${stats.rmse.toFixed(3)} L/R ${l}/${r} max ${stats.maxErr.toFixed(3)} points ${samples.length}`;
-          }
-          result = {
-            ok: true,
-            aborted: false,
-            qualityRejected: false,
-            stats: calStats,
-            appliedStats: calStats
-          };
-        }
-      } else {
-        calStatus.textContent = "Calibration failed. Retry.";
-        result = { ok: false, aborted: false, qualityRejected: false, stats: null, appliedStats: prevCalibStats };
-      }
-      console.log("Calibration matrix:", m);
-      await new Promise(r => setTimeout(r, 550));
-    } else {
-      calStatus.textContent = "Not enough valid samples. Retry with better lighting.";
-      result = { ok: false, aborted: false, qualityRejected: false, stats: null, appliedStats: prevCalibStats };
-      await new Promise(r => setTimeout(r, 650));
-    }
-  } finally {
-    window.removeEventListener("keydown", onKey);
-    calOverlay.style.display = "none";
-    calibrating = false;
-  }
-  return result;
+  return calibrationRunner.runCalibration();
 }
 
 // rect normalized (0..1) of patch in full frame (sender -> receiver)
 const patchRectN = new THREE.Vector4(0, 0, PATCH_W / FULL_W, PATCH_H / FULL_H);
+if (FINAL_SINGLE_DEMO) {
+  patchRectN.set(0, 0, 1, 1);
+}
 
 // ---------- CAPTURE STREAMS ----------
 const lowStream = cLow.captureStream(FPS);
@@ -2488,155 +1258,33 @@ console.log("Tracks:", {
 });
 
 // ---------- RECEIVER COMPOSITOR (shader) ----------
-type ReceiverComposite = {
-  setLowVideo: (v: HTMLVideoElement) => void;
-  setPatchVideo: (v: HTMLVideoElement) => void;
-  setMeta: (gaze: THREE.Vector2, rectN: THREE.Vector4) => void;
-  render: () => number | null;
-  getGpuMs: () => number | null;
-};
+const receiverComposite = FINAL_SINGLE_DEMO
+  ? null
+  : createReceiverComposite(cOut, {
+      width: FULL_W,
+      height: FULL_H,
+      initialFoveaR: FOVEA_R,
+      initialFeather: FEATHER
+    });
 
-function createReceiverComposite(canvas: HTMLCanvasElement): ReceiverComposite {
-  const rr = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
-  rr.setSize(FULL_W, FULL_H, false);
-  rr.setPixelRatio(1);
-
-  const tRecv = new GpuTimer(rr);
-  let lastGpuMs: number | null = null;
-
-  const fsScene = new THREE.Scene();
-  const fsCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-
-  // Create dummy textures to avoid shader compilation errors
-  // Use CanvasTexture instead of DataTexture for better compatibility
-  const dummyCanvas = document.createElement("canvas");
-  dummyCanvas.width = 2;  // Use 2x2 instead of 1x1 for better compatibility
-  dummyCanvas.height = 2;
-  const dummyCtx = dummyCanvas.getContext("2d");
-  if (dummyCtx) {
-    dummyCtx.fillStyle = "#000000";
-    dummyCtx.fillRect(0, 0, 2, 2);
-  }
-  const dummyTex = new THREE.CanvasTexture(dummyCanvas);
-  dummyTex.needsUpdate = true;
-  dummyTex.minFilter = THREE.LinearFilter;
-  dummyTex.magFilter = THREE.LinearFilter;
-  dummyTex.wrapS = THREE.ClampToEdgeWrapping;
-  dummyTex.wrapT = THREE.ClampToEdgeWrapping;
-  dummyTex.flipY = false;  // Video textures don't flip
-
-  const uniforms = {
-    tLow: { value: dummyTex },
-    tPatch: { value: dummyTex },
-    uGaze: { value: new THREE.Vector2(0, 0) },      // NDC
-    uRect: { value: new THREE.Vector4(0, 0, 0.5, 0.5) }, // normalized xywh
-    uRadius: { value: FOVEA_R },
-    uFeather: { value: FEATHER },
-    uAspect: { value: FULL_W / FULL_H }
-  };
-
-  const mat = new THREE.ShaderMaterial({
-    uniforms,
-    vertexShader: `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = vec4(position.xy, 0.0, 1.0);
-      }
-    `,
-    fragmentShader: `
-      precision highp float;
-      varying vec2 vUv;
-      uniform sampler2D tLow;
-      uniform sampler2D tPatch;
-      uniform vec2 uGaze;
-      uniform vec4 uRect;
-      uniform float uRadius;
-      uniform float uFeather;
-      uniform float uAspect;
-
-      float insideRect(vec2 uv, vec4 r) {
-        vec2 rBL = vec2(r.x, 1.0 - (r.y + r.w));
-        vec2 p = (uv - rBL) / r.zw;
-        return step(0.0, p.x) * step(0.0, p.y) * step(p.x, 1.0) * step(p.y, 1.0);
-      }
-
-      vec2 rectUV(vec2 uv, vec4 r) {
-        vec2 rBL = vec2(r.x, 1.0 - (r.y + r.w));
-        return (uv - rBL) / r.zw;
-      }
-
-      void main() {
-        vec4 low = texture2D(tLow, vUv);
-        float inR = insideRect(vUv, uRect);
-        vec2 puv = rectUV(vUv, uRect);
-        vec4 patch = texture2D(tPatch, puv);
-        vec2 p = vUv * 2.0 - 1.0;
-        vec2 d = p - uGaze;
-        d.x *= uAspect;
-        float dist = length(d);
-        float m = smoothstep(uRadius + uFeather, uRadius, dist);
-        float blend = m * inR;
-        gl_FragColor = mix(low, patch, blend);
-      }
-    `,
-    depthTest: false,
-    depthWrite: false
-  });
-
-  // Log shader compilation errors if any
-  mat.onBeforeCompile = (shader) => {
-    // Shader will be compiled here, errors will be caught by Three.js
-  };
-
-  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
-  fsScene.add(quad);
-
-  let lowTex: THREE.VideoTexture | null = null;
-  let patchTex: THREE.VideoTexture | null = null;
-
-  return {
-    setLowVideo(v) {
-      lowTex = new THREE.VideoTexture(v);
-      lowTex.minFilter = THREE.LinearFilter;
-      lowTex.magFilter = THREE.LinearFilter;
-      lowTex.generateMipmaps = false;
-      uniforms.tLow.value = lowTex;
-    },
-    setPatchVideo(v) {
-      patchTex = new THREE.VideoTexture(v);
-      patchTex.minFilter = THREE.LinearFilter;
-      patchTex.magFilter = THREE.LinearFilter;
-      patchTex.generateMipmaps = false;
-      uniforms.tPatch.value = patchTex;
-    },
-    setMeta(g, rectN) {
-      uniforms.uGaze.value.copy(g);
-      uniforms.uRect.value.copy(rectN);
-      uniforms.uRadius.value = FOVEA_R;
-      uniforms.uFeather.value = FEATHER;
-    },
-    render() {
-      // Only render if textures are ready (avoid shader errors)
-      if (!lowTex || !patchTex) return lastGpuMs;
-      
-      if (tRecv.supported) tRecv.begin();
-      try {
-        rr.render(fsScene, fsCam);
-      } catch (e) {
-        console.error("Receiver composite render error:", e);
-      }
-      if (tRecv.supported) tRecv.end();
-      lastGpuMs = tRecv.poll();
-      return lastGpuMs;
-    },
-    getGpuMs() {
-      return lastGpuMs;
+function bindReceiverToLocalStreams(reason: string) {
+  try {
+    vLow.srcObject = new MediaStream([lowTrack]);
+    vPatch.srcObject = new MediaStream([patchTrack]);
+    vLow.play().catch(() => {});
+    vPatch.play().catch(() => {});
+    if (receiverComposite) {
+      receiverComposite.setLowVideo(vLow);
+      receiverComposite.setPatchVideo(vPatch);
     }
-  };
+    telEvent("receiver_source_local", { reason });
+  } catch (err) {
+    console.warn("Local receiver binding failed:", err);
+  }
 }
 
-const receiverComposite = createReceiverComposite(cOut);
+// Bootstrap with local streams so FINAL mode is never black, even if loopback is unavailable.
+bindReceiverToLocalStreams("bootstrap");
 
 // ---------- LOOPBACK WEBRTC ----------
 const remoteTracks: Record<string, MediaStreamTrack> = {};
@@ -2660,7 +1308,7 @@ try {
           FOVEA_R = m.foveaR;
           FEATHER = m.feather;
 
-          receiverComposite.setMeta(m.gaze, m.rect);
+          receiverComposite?.setMeta(m.gaze, m.rect, m.foveaR, m.feather);
           return;
         }
 
@@ -2677,7 +1325,7 @@ try {
               // legacy
               const g = msg.gaze as [number, number];
               const r = msg.rect as [number, number, number, number];
-              receiverComposite.setMeta(new THREE.Vector2(g[0], g[1]), new THREE.Vector4(r[0], r[1], r[2], r[3]));
+              receiverComposite?.setMeta(new THREE.Vector2(g[0], g[1]), new THREE.Vector4(r[0], r[1], r[2], r[3]));
             }
           } catch {}
         }
@@ -2727,7 +1375,10 @@ try {
       patchSender,
       pcSend: loop.pcSend,
       pcRecv: loop.pcRecv,
-      intervalMs: 500
+      intervalMs: 500,
+      bw: BW,
+      tel: TEL,
+      onEvent: telEvent
     });
   }
 } catch (err) {
@@ -2752,8 +1403,12 @@ function attachVideosIfReady() {
   vLow.play().catch(()=>{});
   vPatch.play().catch(()=>{});
 
-  receiverComposite.setLowVideo(vLow);
-  receiverComposite.setPatchVideo(vPatch);
+  receiverComposite?.setLowVideo(vLow);
+  receiverComposite?.setPatchVideo(vPatch);
+  telEvent("receiver_source_remote", {
+    low_track_id: trackMap.low,
+    patch_track_id: trackMap.patch
+  });
 }
 
 // ---------- SENDER META ----------
@@ -2764,7 +1419,7 @@ function computePatchRectTopLeft(gaze: THREE.Vector2) {
   const cx = (gx * 0.5 + 0.5) * FULL_W;
   const cy = (-gy * 0.5 + 0.5) * FULL_H; // top-left origin (NDC Y+ is up, screen Y+ is down)
 
-  // Keep this path deterministic: gazeForPatch is already smoothed by updatePatchFocus().
+  // Keep this path deterministic: gazeForPatch is the Kalman-controlled signal.
   const maxX = FULL_W - PATCH_W;
   const maxY = FULL_H - PATCH_H;
   const desiredX = Math.round(clamp(cx - PATCH_W / 2, 0, maxX));
@@ -2896,17 +1551,21 @@ mask:       r=${FOVEA_R.toFixed(2)} f=${FEATHER.toFixed(2)}`;
 
 // ---------- MAIN LOOP ----------
 let frame = 0;
+let tickLastMs = 0;
 function tick(t: number) {
   requestAnimationFrame(tick);
   frame++;
+  const dtSec = tickLastMs > 0 ? clamp((t - tickLastMs) / 1000, 1 / 240, 0.080) : (1 / FPS);
+  tickLastMs = t;
 
   // Choose gaze source: eye tracking with hysteresis + graceful fallback.
   const gf = gaze.getFrame();
 
   // Hysteresis on confidence.
+  const eyeConf = gf.hasIris ? gf.conf : 0;
   const prevEyeLock = eyeLock;
-  if (!eyeLock && gf.conf >= ENTER_CONF) eyeLock = true;
-  else if (eyeLock && gf.conf <= EXIT_CONF) eyeLock = false;
+  if (!eyeLock && eyeConf >= ENTER_CONF) eyeLock = true;
+  else if (eyeLock && eyeConf <= EXIT_CONF) eyeLock = false;
 
   if (eyeLock) {
     eyeEverLocked = true;
@@ -2930,15 +1589,20 @@ function tick(t: number) {
   } else if (!recentlyLostEye) {
     gazeNDC.lerp(mouseNDC, MOUSE_FOLLOW_SLOW);
   }
-  updateGazeEstimate(gazeNDC, useEye, gf.conf, t);
-  updatePatchFocus(gazeEstNDC, useEye, gf.conf, gazeFilterMode);
+  updateGazeEstimate(gazeNDC, useEye, eyeConf, t);
   const gazeForPatch = gazeFocusNDC;
+  const hudConf = useEye ? eyeConf : 0;
+  updateHudMetrics(hudConf, gazeFilterMode, t);
+  updateGazeReticle(gazeForPatch, hudConf);
 
   update(t);
 
-  computePatchRectTopLeft(gazeForPatch);
-  captureReadingAnalysisSample(t, gf, useEye, gazeNDC, gazeForPatch, gazeEstNDC, gazeFilterMode);
-
+  if (FINAL_SINGLE_DEMO) {
+    if (patchMode !== FINAL_PATCH_MODE) patchMode = FINAL_PATCH_MODE;
+    patchRectN.set(0, 0, 1, 1);
+  } else {
+    computePatchRectTopLeft(gazeForPatch);
+  }
   const timeSec = t * 0.001;
 
   // helper per impostare entrambe le material
@@ -3021,8 +1685,12 @@ function tick(t: number) {
   const roiY = Math.floor((patchCursorY * PATCH_H) - roiH / 2);
   
   // Clamp ROI to canvas bounds
-  const roiXClamped = Math.max(0, Math.min(roiX, PATCH_W - roiW));
-  const roiYClamped = Math.max(0, Math.min(roiY, PATCH_H - roiH));
+  let roiXClamped = Math.max(0, Math.min(roiX, PATCH_W - roiW));
+  let roiYClamped = Math.max(0, Math.min(roiY, PATCH_H - roiH));
+  if (patchMode === 4 && READING_ZOOM_FRAME_STATIC) {
+    roiXClamped = Math.floor((PATCH_W - roiW) * 0.5);
+    roiYClamped = Math.floor((PATCH_H - roiH) * 0.5);
+  }
   
   // Render based on mode
   if (patchMode === 0) {
@@ -3128,11 +1796,19 @@ function tick(t: number) {
     ctxPatch.putImageData(imageData, roiXClamped, roiYClamped);
   } else if (patchMode === 4) {
     // Mode 4: Reading demo with magnified region around gaze
-    drawReadingDemoPage(readingCtx, timeSec);
+    drawReadingDemoPage(readingCtx, PATCH_W, PATCH_H, READING_SUPERSAMPLE, timeSec);
 
-    // Base layer: full "document" page, slightly dimmed (periphery).
+    // Base layer: blurred text page in periphery for a clear foveated effect.
     ctxPatch.save();
-    ctxPatch.globalAlpha = 0.62;
+    ctxPatch.filter = "blur(3.5px) saturate(0.92)";
+    ctxPatch.drawImage(
+      readingCanvas,
+      0, 0, readingCanvas.width, readingCanvas.height,
+      0, 0, PATCH_W, PATCH_H
+    );
+    ctxPatch.restore();
+    ctxPatch.save();
+    ctxPatch.globalAlpha = 0.36;
     ctxPatch.drawImage(
       readingCanvas,
       0, 0, readingCanvas.width, readingCanvas.height,
@@ -3143,8 +1819,27 @@ function tick(t: number) {
     // Zoom source around gaze point.
     const srcW = Math.max(140, Math.floor(roiW * 0.68));
     const srcH = Math.max(140, Math.floor(roiH * 0.68));
-    const srcX = Math.floor(clamp((patchCursorX * PATCH_W) - srcW / 2, 0, PATCH_W - srcW));
-    const srcY = Math.floor(clamp((patchCursorY * PATCH_H) - srcH / 2, 0, PATCH_H - srcH));
+    const srcXDesired = clamp((patchCursorX * PATCH_W) - srcW / 2, 0, PATCH_W - srcW);
+    const srcYDesired = clamp((patchCursorY * PATCH_H) - srcH / 2, 0, PATCH_H - srcH);
+    if (!readingZoomSrcInit) {
+      readingZoomSrcInit = true;
+      readingZoomSrcX = srcXDesired;
+      readingZoomSrcY = srcYDesired;
+    }
+    const zoomConf = clamp((gf.conf - 0.45) / 0.40, 0, 1);
+    const srcAlpha = lerp(READING_ZOOM_SRC_ALPHA_LOW_CONF, READING_ZOOM_SRC_ALPHA, zoomConf);
+    const srcStepXRaw = srcXDesired - readingZoomSrcX;
+    const srcStepYRaw = srcYDesired - readingZoomSrcY;
+    const srcStepX = Math.abs(srcStepXRaw) <= READING_ZOOM_SRC_DEADBAND_PX
+      ? 0
+      : clamp(srcStepXRaw * srcAlpha, -READING_ZOOM_SRC_MAX_STEP_PX, READING_ZOOM_SRC_MAX_STEP_PX);
+    const srcStepY = Math.abs(srcStepYRaw) <= READING_ZOOM_SRC_DEADBAND_PX
+      ? 0
+      : clamp(srcStepYRaw * srcAlpha, -READING_ZOOM_SRC_MAX_STEP_PX, READING_ZOOM_SRC_MAX_STEP_PX);
+    readingZoomSrcX = clamp(readingZoomSrcX + srcStepX, 0, PATCH_W - srcW);
+    readingZoomSrcY = clamp(readingZoomSrcY + srcStepY, 0, PATCH_H - srcH);
+    const srcX = Math.round(readingZoomSrcX);
+    const srcY = Math.round(readingZoomSrcY);
     const srcXHi = srcX * READING_SUPERSAMPLE;
     const srcYHi = srcY * READING_SUPERSAMPLE;
     const srcWHi = srcW * READING_SUPERSAMPLE;
@@ -3157,33 +1852,28 @@ function tick(t: number) {
       roiXClamped, roiYClamped, roiW, roiH
     );
 
-    // Visual guide for expected behavior.
-    ctxPatch.strokeStyle = "#ffd166";
-    ctxPatch.lineWidth = 4;
+    ctxPatch.strokeStyle = "rgba(255, 217, 140, 0.82)";
+    ctxPatch.lineWidth = 3;
     ctxPatch.strokeRect(roiXClamped, roiYClamped, roiW, roiH);
-
-    ctxPatch.fillStyle = "rgba(20,20,20,0.75)";
-    ctxPatch.fillRect(roiXClamped + 8, roiYClamped + 8, Math.min(420, roiW - 16), 28);
-    ctxPatch.fillStyle = "#ffe39a";
-    ctxPatch.font = "bold 15px ui-monospace, monospace";
-    ctxPatch.textAlign = "left";
-    ctxPatch.textBaseline = "top";
-    ctxPatch.fillText("Reading demo: lo zoom deve seguire il tuo sguardo", roiXClamped + 14, roiYClamped + 14);
   }
   
   // Debug: Draw ROI border in all modes to make it visible
-  ctxPatch.strokeStyle = patchMode === 0 ? "#333333" : (patchMode === 4 ? "#ffd166" : "#00ff00");
-  ctxPatch.lineWidth = patchMode === 0 ? 1 : 3;
-  ctxPatch.strokeRect(roiXClamped, roiYClamped, roiW, roiH);
+  if (patchMode !== 4) {
+    ctxPatch.strokeStyle = patchMode === 0 ? "#333333" : "#00ff00";
+    ctxPatch.lineWidth = patchMode === 0 ? 1 : 3;
+    ctxPatch.strokeRect(roiXClamped, roiYClamped, roiW, roiH);
+  }
   
-  // Add mode indicator text in corner
-  ctxPatch.save();
-  ctxPatch.fillStyle = "#ffffff";
-  ctxPatch.font = "bold 20px ui-monospace, monospace";
-  ctxPatch.textAlign = "left";
-  ctxPatch.textBaseline = "top";
-  ctxPatch.fillText(`Mode ${patchMode}: ${PATCH_MODE_LABELS[patchMode] ?? "unknown"}`, 10, 10);
-  ctxPatch.restore();
+  if (!FINAL_SINGLE_DEMO) {
+    // Add mode indicator text in corner
+    ctxPatch.save();
+    ctxPatch.fillStyle = "#ffffff";
+    ctxPatch.font = "bold 20px ui-monospace, monospace";
+    ctxPatch.textAlign = "left";
+    ctxPatch.textBaseline = "top";
+    ctxPatch.fillText(`Mode ${patchMode}: ${PATCH_MODE_LABELS[patchMode] ?? "unknown"}`, 10, 10);
+    ctxPatch.restore();
+  }
   
   const patchGpu = null; // 2D canvas doesn't have GPU timing
   
@@ -3197,8 +1887,16 @@ function tick(t: number) {
     });
   }
 
-  // receiver composite (when videos ready)
-  const recvGpu = receiverComposite.render();
+  // Receiver output:
+  // - FINAL_SINGLE_DEMO: render directly to cOut with a circular "lens sphere".
+  // - Normal mode: shader composite from low + patch tracks.
+  let recvGpu: number | null = null;
+  if (FINAL_SINGLE_DEMO) {
+    renderFinalLensOutput(gazeForPatch, useEye ? eyeConf : 0, timeSec, dtSec, gazeFilterMode);
+  } else if (receiverComposite) {
+    recvGpu = receiverComposite.render();
+  }
+  captureReadingAnalysisSample(t, gf, useEye, gazeNDC, gazeForPatch, gazeEstNDC, gazeFilterMode);
 
   // ---- GOVERNOR (GPU-first) ----
   const totalGpu = (lowGpu ?? 0) + (patchGpu ?? 0) + (recvGpu ?? 0);
@@ -3217,9 +1915,14 @@ function tick(t: number) {
     FEATHER = BASE_FEATHER;
   }
 
+  // Keep receiver meta coherent also when DataChannel is unavailable.
+  if (!FINAL_SINGLE_DEMO) {
+    receiverComposite?.setMeta(gazeForPatch, patchRectN, FOVEA_R, FEATHER);
+  }
+
   // sender meta @ ~30Hz (binary v2)
   if (loop && loop.dcSend.readyState === "open" && frame % 1 === 0) {
-    const meta = encodeMetaBinary(gazeForPatch, patchRectN, useEye ? gf.conf : 0, FOVEA_R, FEATHER);
+    const meta = encodeMetaBinary(gazeForPatch, patchRectN, useEye ? eyeConf : 0, FOVEA_R, FEATHER);
     loop.dcSend.send(meta);
   }
 
@@ -3233,7 +1936,7 @@ function tick(t: number) {
 
       // Update TEL for allocator access (before telemetry sample)
       TEL.useEye = useEye;
-      TEL.gazeConf = useEye ? gf.conf : 0;
+      TEL.gazeConf = useEye ? eyeConf : 0;
       TEL.gazeMode = gazeFilterMode;
       
       // Calculate ROI size for telemetry (same as in PATCH rendering)
@@ -3253,7 +1956,7 @@ function tick(t: number) {
         gaze_filt_y: +gazeForPatch.y.toFixed(4),
         gaze_mode: TEL.gazeMode,
         use_eye: !!useEye,
-        conf: +(useEye ? gf.conf : 0).toFixed(3),
+        conf: +(useEye ? eyeConf : 0).toFixed(3),
 
         // rect
         rect: [
@@ -3339,7 +2042,7 @@ loss worst:  ${TEL.lossPct != null ? TEL.lossPct.toFixed(2) : "…"}%
 rtt:         ${BW.rttMs ?? "…"} ms
 ice aob:     ${TEL.aobKbps ?? "…"} kbps  ice_rtt: ${TEL.iceRttMs ?? "…"} ms
 tele:       ${TEL.enabled ? "ON" : "OFF"}  lines=${TEL.lines.length}
-keys:       B toggle | 1 mobile | 2 balanced | 3 lan | [ ] adjust cap | T tele | D download | X clear | M workload | C auto | Shift+C calib-only | R analysis | A auto-calib+analysis
+keys:       F fullscreen | H HUD | B toggle | 1 mobile | 2 balanced | 3 lan | [ ] adjust cap | T tele | D download | X clear | M workload | C auto | Shift+C calib-only | R analysis | A auto-calib+analysis
 workload:   patch mode=${patchMode} (${PATCH_MODE_LABELS[patchMode] ?? "unknown"}) ROI=${Math.min(ROI_W, PATCH_W)}x${Math.min(ROI_H, PATCH_H)}
 eye conf:   ${gf.conf.toFixed(2)} ${gf.hasIris ? "iris" : "head"}
 

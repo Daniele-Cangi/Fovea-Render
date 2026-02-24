@@ -26,6 +26,7 @@ export type MediapipeGazeOptions = {
   smoothAlpha?: number;             // EMA
   locateFileBase?: string;          // where to load wasm/assets from
   video?: HTMLVideoElement;         // optional
+  eyeOnlyMode?: boolean;            // true: gaze driven only by iris/eyes
 };
 
 function clamp(v: number, a: number, b: number) { return Math.max(a, Math.min(b, v)); }
@@ -222,13 +223,42 @@ function fitResidual(p: CalibFitSample, m: CalibMatrix) {
   return Math.sqrt(dx*dx + dy*dy);
 }
 
-// Solve robust weighted calibration model. Try poly2 first, fallback to affine.
+function fitStats(samples: CalibFitSample[], m: CalibMatrix) {
+  if (samples.length === 0) return { rmse: Infinity, maxErr: Infinity };
+  let se = 0;
+  let maxErr = 0;
+  for (const p of samples) {
+    const e = fitResidual(p, m);
+    se += e * e;
+    if (e > maxErr) maxErr = e;
+  }
+  return { rmse: Math.sqrt(se / samples.length), maxErr };
+}
+
+function chooseModel(samples: CalibFitSample[]) {
+  const affine = solveAffineWeighted(samples);
+  const poly = solvePoly2Weighted(samples);
+  if (!affine && !poly) return null;
+  if (!affine) return { model: poly!, kind: "poly2" as const };
+  if (!poly) return { model: affine, kind: "affine" as const };
+
+  const a = fitStats(samples, affine);
+  const p = fitStats(samples, poly);
+  const polyBetterRmse = p.rmse <= a.rmse * 0.93;
+  const polyNotWorseTail = p.maxErr <= a.maxErr * 1.02;
+  if (polyBetterRmse && polyNotWorseTail) return { model: poly, kind: "poly2" as const };
+  return { model: affine, kind: "affine" as const };
+}
+
+// Solve robust weighted calibration model with complexity guard.
 function fitAffine(samples: CalibFitSample[]): CalibMatrix | null {
   if (samples.length < 6) return null;
 
   let active = samples.slice();
-  let model = solvePoly2Weighted(active) ?? solveAffineWeighted(active);
-  if (!model) return null;
+  let picked = chooseModel(active);
+  if (!picked) return null;
+  let model = picked.model;
+  let kind = picked.kind;
 
   // Robust refinement: remove points with large residuals and refit.
   for (let iter = 0; iter < 2; iter++) {
@@ -241,10 +271,14 @@ function fitAffine(samples: CalibFitSample[]): CalibMatrix | null {
 
     if (filtered.length < 6 || filtered.length === active.length) break;
 
-    const next = solvePoly2Weighted(filtered) ?? solveAffineWeighted(filtered);
+    const nextPicked = kind === "poly2"
+      ? (chooseModel(filtered) ?? { model: solveAffineWeighted(filtered), kind: "affine" as const })
+      : (chooseModel(filtered) ?? { model: solveAffineWeighted(filtered), kind: "affine" as const });
+    const next = nextPicked?.model ?? null;
     if (!next) break;
     active = filtered;
     model = next;
+    kind = nextPicked.kind;
   }
 
   return model;
@@ -275,6 +309,7 @@ export class MediapipeGazeProvider {
       mirrorX: opts.mirrorX ?? true,
       smoothAlpha: opts.smoothAlpha ?? 0.18,
       locateFileBase: opts.locateFileBase ?? "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/",
+      eyeOnlyMode: opts.eyeOnlyMode ?? true,
       video: opts.video ?? (() => {
         const v = document.createElement("video");
         v.autoplay = true; v.playsInline = true; v.muted = true;
@@ -365,14 +400,11 @@ export class MediapipeGazeProvider {
 
     const lm = results.multiFaceLandmarks[0];
 
-    // --- HEAD proxy (robust) ---
-    const nose = lm[1]; // nose tip
-    let headX = (nose.x - 0.5) * 2.2;
-    let headY = (nose.y - 0.5) * 2.2;
-
     // --- IRIS proxy (refineLandmarks gives 10 extra points) ---
     let irisX = 0, irisY = 0;
     let irisConsistency = 0;
+    let openConf = 0;
+    let eyeGeomConf = 0;
     let hasIris = lm.length >= 478;
 
     if (hasIris) {
@@ -407,23 +439,58 @@ export class MediapipeGazeProvider {
 
       const ly = (leftIris.y - lmidY) / lh;
       const ry = (rightIris.y - rmidY) / rh;
+      // Compensate in-plane roll per eye, then fuse robustly.
+      const lTheta = Math.atan2(l1.y - l0.y, l1.x - l0.x);
+      const rTheta = Math.atan2(r1.y - r0.y, r1.x - r0.x);
+      const lCos = Math.cos(lTheta), lSin = Math.sin(lTheta);
+      const rCos = Math.cos(rTheta), rSin = Math.sin(rTheta);
+      const lxr = lx * lCos + ly * lSin;
+      const lyr = -lx * lSin + ly * lCos;
+      const rxr = rx * rCos + ry * rSin;
+      const ryr = -rx * rSin + ry * rCos;
 
-      irisX = (lx + rx) * 0.9;   // gain
-      irisY = (ly + ry) * 0.9;
+      const xAgree = 1.0 - clamp(Math.abs(lxr - rxr) / 0.32, 0, 1);
+      const yAgree = 1.0 - clamp(Math.abs(lyr - ryr) / 0.36, 0, 1);
+      irisConsistency = clamp(0.68 * xAgree + 0.32 * yAgree, 0, 1);
 
-      const xAgree = 1.0 - clamp(Math.abs(lx - rx) / 0.35, 0, 1);
-      const yAgree = 1.0 - clamp(Math.abs(ly - ry) / 0.35, 0, 1);
-      irisConsistency = clamp(0.7 * xAgree + 0.3 * yAgree, 0, 1);
+      const lOpenConf = clamp((lh - 0.010) / 0.022, 0, 1);
+      const rOpenConf = clamp((rh - 0.010) / 0.022, 0, 1);
+      openConf = (lOpenConf + rOpenConf) * 0.5;
+
+      const lGeom = clamp((lw - 0.030) / 0.050, 0, 1);
+      const rGeom = clamp((rw - 0.030) / 0.050, 0, 1);
+      eyeGeomConf = (lGeom + rGeom) * 0.5;
+
+      let wl = Math.max(0.05, lOpenConf * lGeom);
+      let wr = Math.max(0.05, rOpenConf * rGeom);
+      if (Math.abs(lxr - rxr) > 0.34 || Math.abs(lyr - ryr) > 0.40) {
+        if (wl > wr * 1.20) wr *= 0.35;
+        else if (wr > wl * 1.20) wl *= 0.35;
+      }
+      const wsum = Math.max(1e-6, wl + wr);
+      const bx = (lxr * wl + rxr * wr) / wsum;
+      const by = (lyr * wl + ryr * wr) / wsum;
+
+      // Gains chosen for eye-only drive. Keep Y a bit more conservative.
+      irisX = clamp(bx * 1.05, -1.35, 1.35);
+      irisY = clamp(by * 0.98, -1.35, 1.35);
     }
 
     this._hasIris = hasIris;
 
-    // --- RAW mix (head + iris) ---
-    // Give more weight to iris for precision, keep a small head term for robustness.
-    const headW = hasIris ? 0.28 : 0.95;
-    const irisW = hasIris ? (1.20 + 0.20 * irisConsistency) : 0.0;
-    let rawX = headX * headW + irisX * irisW;
-    let rawY = headY * (headW * 1.15) + irisY * (irisW * 0.95);
+    // --- RAW gaze ---
+    // Eye-only mode: no head contribution in gaze signal.
+    let rawX = irisX;
+    let rawY = irisY;
+    if (!this.opts.eyeOnlyMode) {
+      const nose = lm[1]; // nose tip
+      const headX = (nose.x - 0.5) * 2.2;
+      const headY = (nose.y - 0.5) * 2.2;
+      const headW = hasIris ? 0.28 : 0.95;
+      const irisW = hasIris ? (1.20 + 0.20 * irisConsistency) : 0.0;
+      rawX = headX * headW + irisX * irisW;
+      rawY = headY * (headW * 1.15) + irisY * (irisW * 0.95);
+    }
 
     // Store unmirrored for calibration
     this._rawXUnmirrored = rawX;
@@ -435,14 +502,16 @@ export class MediapipeGazeProvider {
     const faceW = dist2(cheekL, cheekR);           // ~0..1
     const sizeConf = clamp((faceW - 0.12) / 0.20, 0, 1);
 
-    // eye openness proxy -> if blinking, confidence dips (optional)
-    const lu = lm[159], ll = lm[145], ru = lm[386], rl = lm[374];
-    const openL = Math.abs(ll.y - lu.y);
-    const openR = Math.abs(rl.y - ru.y);
-    const open = (openL + openR) * 0.5;
-    const openConf = clamp((open - 0.008) / 0.018, 0, 1);
+    if (!hasIris) openConf = 0;
 
-    let conf = 0.45 * sizeConf + 0.25 * openConf + (hasIris ? (0.20 + 0.10 * irisConsistency) : 0.0);
+    let conf = this.opts.eyeOnlyMode
+      ? (0.22 * sizeConf + 0.33 * openConf + 0.30 * irisConsistency + 0.15 * eyeGeomConf)
+      : (0.45 * sizeConf + 0.25 * openConf + (hasIris ? (0.20 + 0.10 * irisConsistency) : 0.0));
+    if (this.opts.eyeOnlyMode && !hasIris) conf *= 0.10;
+    if (this.opts.eyeOnlyMode && hasIris) {
+      const quality = clamp(0.58 * irisConsistency + 0.42 * openConf, 0, 1);
+      conf = (0.06 + conf * 1.14) * lerp(0.80, 1.02, quality);
+    }
     conf = clamp(conf, 0, 1);
 
     // apply calibration BEFORE mirroring (calibration is done on non-mirrored raw values)

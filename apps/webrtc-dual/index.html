@@ -5,46 +5,372 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FoveaRender — WebRTC Dual Stream</title>
     <style>
-      body { margin:0; background:#000; color:#0ff; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-      .wrap { display:flex; gap:12px; padding:12px; }
-      .col { display:flex; flex-direction:column; gap:10px; }
-      .card { border:1px solid rgba(0,255,255,0.2); border-radius:10px; padding:10px; }
-      .row { display:flex; gap:10px; align-items:center; }
-      canvas { background:#000; border-radius:10px; border:1px solid rgba(0,255,255,0.2); }
-      .tiny { font-size:12px; color:rgba(0,255,255,0.85); line-height:1.35; white-space:pre; }
-      .title { font-weight:700; letter-spacing:1px; }
-      .hint { color:rgba(0,255,255,0.65); font-size:12px; }
+      :root {
+        --bg0: #060a11;
+        --bg1: #0d1a28;
+        --bg2: #1a2f42;
+        --ink: #e8f4ff;
+        --muted: rgba(220, 235, 250, 0.78);
+        --accent: #4ff0c8;
+        --accent-hot: #ffc879;
+        --panel-bg: rgba(6, 11, 18, 0.76);
+        --panel-brd: rgba(173, 213, 244, 0.28);
+        --card-bg: rgba(5, 10, 16, 0.72);
+        --card-brd: rgba(173, 213, 244, 0.22);
+        --shadow: 0 24px 58px rgba(0, 0, 0, 0.46);
+      }
+
+      * { box-sizing: border-box; }
+
+      html, body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+      }
+
+      body {
+        color: var(--ink);
+        font-family: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+        background:
+          radial-gradient(140% 100% at 5% 0%, var(--bg2) 0%, var(--bg1) 46%, var(--bg0) 100%);
+      }
+
+      #appRoot {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      .composite-stage {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+      }
+
+      #cOut {
+        width: min(100vw, calc(100vh * 16 / 9));
+        height: min(100vh, calc(100vw * 9 / 16));
+        border-radius: 20px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: #000;
+        box-shadow: var(--shadow);
+      }
+
+      .stage-vignette {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background:
+          radial-gradient(100% 90% at 50% 50%, rgba(0, 0, 0, 0) 45%, rgba(0, 0, 0, 0.32) 100%),
+          linear-gradient(180deg, rgba(0, 0, 0, 0.26), rgba(0, 0, 0, 0.06) 16%, rgba(0, 0, 0, 0.22));
+      }
+
+      .final-caption {
+        position: absolute;
+        left: 50%;
+        bottom: 22px;
+        transform: translateX(-50%);
+        padding: 10px 14px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(7, 14, 22, 0.56);
+        backdrop-filter: blur(6px);
+        color: rgba(236, 244, 252, 0.96);
+        font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+        font-size: 12px;
+        letter-spacing: 0.02em;
+        z-index: 22;
+        pointer-events: none;
+      }
+
+      .gaze-reticle {
+        position: absolute;
+        width: 34px;
+        height: 34px;
+        border-radius: 999px;
+        border: 2px solid rgba(79, 240, 200, 0.95);
+        box-shadow:
+          0 0 0 1px rgba(0, 0, 0, 0.65) inset,
+          0 0 22px rgba(79, 240, 200, 0.65);
+        pointer-events: none;
+        transform: translate(-50%, -50%);
+        z-index: 16;
+      }
+
+      .gaze-reticle::after {
+        content: "";
+        position: absolute;
+        inset: 9px;
+        border-radius: 999px;
+        border: 1px dashed rgba(255, 255, 255, 0.75);
+      }
+
+      .top-hud {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        right: 16px;
+        display: grid;
+        grid-template-columns: 1.4fr auto auto;
+        gap: 12px;
+        align-items: start;
+        z-index: 20;
+      }
+
+      .hud-card {
+        background: var(--panel-bg);
+        border: 1px solid var(--panel-brd);
+        border-radius: 14px;
+        backdrop-filter: blur(8px);
+        box-shadow: var(--shadow);
+      }
+
+      .brand {
+        padding: 12px 14px;
+      }
+
+      .brand .kicker {
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--accent);
+      }
+
+      .brand .title {
+        margin-top: 5px;
+        font-size: 22px;
+        font-weight: 750;
+        letter-spacing: 0.02em;
+      }
+
+      .brand .hint {
+        margin-top: 5px;
+        font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .metric-row {
+        display: flex;
+        gap: 8px;
+        padding: 10px;
+      }
+
+      .pill {
+        min-width: 112px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid var(--card-brd);
+        background: rgba(4, 9, 15, 0.78);
+      }
+
+      .pill .label {
+        display: block;
+        font-size: 10px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: rgba(227, 238, 250, 0.74);
+      }
+
+      .pill .value {
+        margin-top: 3px;
+        display: block;
+        font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+        font-size: 14px;
+        color: var(--ink);
+      }
+
+      .action-box {
+        display: flex;
+        gap: 8px;
+        padding: 10px;
+      }
+
+      .action-btn {
+        appearance: none;
+        border: 1px solid var(--card-brd);
+        background: rgba(7, 12, 20, 0.86);
+        color: var(--ink);
+        border-radius: 10px;
+        padding: 10px 12px;
+        font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .action-btn:hover {
+        border-color: rgba(255, 200, 121, 0.74);
+        color: var(--accent-hot);
+      }
+
+      .diag-rail {
+        position: absolute;
+        top: 124px;
+        right: 16px;
+        bottom: 16px;
+        width: min(430px, 38vw);
+        display: grid;
+        grid-template-rows: auto auto 1fr 1fr;
+        gap: 10px;
+        padding: 12px;
+        border-radius: 16px;
+        border: 1px solid var(--panel-brd);
+        background: var(--panel-bg);
+        backdrop-filter: blur(8px);
+        overflow: auto;
+        z-index: 18;
+        transition: transform 200ms ease, opacity 200ms ease;
+      }
+
+      .stream-card {
+        border: 1px solid var(--card-brd);
+        border-radius: 12px;
+        background: var(--card-bg);
+        padding: 8px;
+      }
+
+      .stream-label {
+        margin-bottom: 6px;
+        font-size: 11px;
+        font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        color: rgba(220, 236, 251, 0.86);
+      }
+
+      #cLow,
+      #cPatch {
+        width: 100%;
+        display: block;
+        border-radius: 10px;
+        background: #000;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+      }
+
+      #cLow { aspect-ratio: 16 / 9; }
+      #cPatch { aspect-ratio: 1 / 1; }
+
+      .tiny {
+        margin: 0;
+        border: 1px solid var(--card-brd);
+        border-radius: 12px;
+        background: var(--card-bg);
+        padding: 10px;
+        white-space: pre;
+        overflow: auto;
+        font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+        font-size: 11px;
+        line-height: 1.35;
+        color: rgba(220, 238, 255, 0.9);
+      }
+
+      body.hud-minimal .diag-rail {
+        transform: translateX(calc(100% + 24px));
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      body.hud-minimal .top-hud .brand .hint {
+        display: none;
+      }
+
+      body.final-single .top-hud,
+      body.final-single .diag-rail {
+        display: none;
+      }
+
+      body.final-single .gaze-reticle {
+        display: none;
+      }
+
+      body.final-single #cOut {
+        width: 100vw;
+        height: 100vh;
+        border-radius: 0;
+        border: 0;
+        box-shadow: none;
+      }
+
+      body.final-single .stage-vignette {
+        background:
+          radial-gradient(120% 90% at 50% 50%, rgba(0, 0, 0, 0) 42%, rgba(0, 0, 0, 0.24) 100%);
+      }
+
+      @media (max-width: 1100px) {
+        .top-hud {
+          grid-template-columns: 1fr;
+        }
+
+        .diag-rail {
+          top: auto;
+          left: 16px;
+          right: 16px;
+          width: auto;
+          height: 46vh;
+          grid-template-rows: auto auto 1fr;
+        }
+
+        #cOut {
+          width: 100vw;
+          height: min(100vh, calc(100vw * 9 / 16));
+          border-radius: 12px;
+        }
+      }
+
       video { display:none; }
     </style>
   </head>
-  <body>
-    <div class="wrap">
-      <div class="col">
-        <div class="card">
-          <div class="title">SENDER (LOCAL)</div>
-          <div class="hint">C = calibrate (3×3). L = toggle LOD. Eye-tracking uses webcam; fallback mouse.</div>
-        </div>
-        <div class="row">
-          <div class="col">
-            <div class="hint">LOW stream (downscaled)</div>
-            <canvas id="cLow"></canvas>
-          </div>
-          <div class="col">
-            <div class="hint">PATCH stream (fovea crop)</div>
-            <canvas id="cPatch"></canvas>
-          </div>
-        </div>
-        <div class="card tiny" id="senderStats">…</div>
-      </div>
-
-      <div class="col">
-        <div class="card">
-          <div class="title">RECEIVER (REMOTE COMPOSITE)</div>
-          <div class="hint">Recomposed from two incoming tracks + metadata over DataChannel.</div>
-        </div>
+  <body class="final-single">
+    <div id="appRoot">
+      <div class="composite-stage">
         <canvas id="cOut"></canvas>
-        <div class="card tiny" id="recvStats">…</div>
+        <div id="gazeReticle" class="gaze-reticle"></div>
       </div>
+      <div class="stage-vignette"></div>
+      <div class="final-caption">Lente sferica: la zona dentro la sfera resta nitida, il resto e blur.</div>
+
+      <header class="top-hud">
+        <div class="brand hud-card">
+          <div class="kicker">Fovea Render | Advanced Stage</div>
+          <div class="title">Adaptive Focus Showcase</div>
+          <div class="hint">C calibra | A auto calib + analisi | R analisi | M modalita patch | F fullscreen | H HUD</div>
+        </div>
+        <div class="metric-row hud-card">
+          <div class="pill">
+            <span class="label">Filter Mode</span>
+            <span id="hudFilterMode" class="value">fallback</span>
+          </div>
+          <div class="pill">
+            <span class="label">Confidence</span>
+            <span id="hudConf" class="value">0.00</span>
+          </div>
+          <div class="pill">
+            <span class="label">Calib RMSE</span>
+            <span id="hudCalibRmse" class="value">n/a</span>
+          </div>
+        </div>
+        <div class="action-box hud-card">
+          <button id="btnFullscreen" class="action-btn" type="button">Go Fullscreen (F)</button>
+          <button id="btnHud" class="action-btn" type="button">Hide HUD (H)</button>
+        </div>
+      </header>
+
+      <aside id="diagRail" class="diag-rail">
+        <section class="stream-card">
+          <div class="stream-label">LOW stream (downscaled)</div>
+          <canvas id="cLow"></canvas>
+        </section>
+        <section class="stream-card">
+          <div class="stream-label">PATCH stream (fovea crop)</div>
+          <canvas id="cPatch"></canvas>
+        </section>
+        <pre id="senderStats" class="tiny">...</pre>
+        <pre id="recvStats" class="tiny">...</pre>
+      </aside>
     </div>
 
     <!-- hidden video sinks for remote tracks -->
