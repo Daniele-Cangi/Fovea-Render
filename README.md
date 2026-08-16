@@ -276,6 +276,19 @@ Telemetry fields should be interpreted as experimental browser measurements. The
 - **Prefer explicit state machines.** Avoid adding more interacting thresholds directly to the main render loop.
 - **Fallback is a feature.** Loss of gaze confidence must degrade gracefully to a documented rendering policy.
 
+## Contributing and current engineering frontier
+
+Contributions are welcome. Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) and the milestone boundaries in [`RECOVERY_PLAN.md`](RECOVERY_PLAN.md).
+
+The preferred contribution model is **separate, measurable laboratories before end-to-end integration**. Current work is naturally divided across:
+
+- **Gaze Lab** — held-out calibration evaluation, replayable gaze observations, filtering and confidence-state validation;
+- **Render Lab** — same-scene LOW/PATCH generation, alignment, local reference compositing and render-resource behavior;
+- **Transport Lab** — versioned metadata, synchronization, receiver behavior and controlled network experiments;
+- **Measurement infrastructure** — automated tests, CI, browser capability reporting, GPU timing, telemetry and benchmark tooling.
+
+Please avoid adding new tuning heuristics or integrated-mode branches without an explicit measurement path. A contribution that clarifies a failure, removes an ambiguity, or establishes a reproducible baseline is useful even if it does not improve headline performance.
+
 ## Intended future evaluation
 
 A credible benchmark should compare at least:
@@ -300,7 +313,7 @@ The report should measure:
 
 ## License
 
-A license file is not currently included in the repository. Until one is added, the source should not be assumed to be available under the MIT License or any other open-source license.
+FoveaRender is licensed under the [Apache License 2.0](LICENSE).
 
 ---
 
